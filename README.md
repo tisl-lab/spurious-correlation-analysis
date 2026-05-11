@@ -53,18 +53,6 @@ generalize. Here, if all "0" digits appear on red backgrounds, a model may learn
 "red → 0" rather than "round shape → 0". When the background color changes, accuracy
 drops — revealing the shortcut.
 
-### Dataset Design
-Colored MNIST assigns a background color to each digit class in a fixed cycle:
-
-| Digit | Aligned color |
-|-------|--------------|
-| 0, 3, 6, 9 | Red   |
-| 1, 4, 7    | Green |
-| 2, 5, 8    | Blue  |
-
-Each image's background color is encoded in its filename (`red_1234.png`, etc.) —
-no pixel-level color analysis needed.
-
 ### Two Prompt Strategies
 
 | Mode | Example prompt | What it tests |
@@ -80,12 +68,6 @@ Only the CLIP **image encoder** is updated during fine-tuning; the text encoder 
 frozen. Classification logits are still computed as cosine similarity between image and
 text features (× logit scale), so fine-tuned and zero-shot results are directly
 comparable.
-
-> **MPS note**: Apple Silicon MPS has known autograd instabilities with CLIP's ViT
-> transformer. Fine-tuning automatically falls back to CPU on MPS devices and returns
-> the model to MPS for inference.
-
----
 
 ## Quick Start
 
@@ -139,30 +121,6 @@ The 4-panel figure shows:
 3. **Per-background-color accuracy** (red / green / blue)
 4. **Summary table** with Δ vs zero-shot baseline
 
----
-
-## Running on Compute Canada (HPC)
-
-### One-time setup (run on login node)
-```bash
-bash cc_setup.sh
-```
-This loads modules (`python/3.10`, `cuda/11.8`, `cudnn`), creates a virtualenv in
-`$PROJECT/clip_env`, installs all dependencies, and pre-downloads CLIP weights so
-compute nodes don't need internet access.
-
-### Parallel sweep with SLURM
-```bash
-# Edit submit_sweep.sh: set --account=YOUR_ACCOUNT
-mkdir -p logs
-sbatch submit_sweep.sh
-```
-This submits a SLURM array job with one task per fine-tune percentage (0%, 10%, …, 90%),
-all running in parallel on separate GPUs. Results land in
-`results/ft_sweep/pct_{0,10,...,90}/`.
-
----
-
 ## Understanding the Output
 
 Each run produces three CSVs in `--output_dir`:
@@ -192,12 +150,4 @@ CLIP is influenced by that spurious color cue rather than digit shape alone.
 
 ---
 
-## Diagnostics & Tests
 
-```bash
-# Check fine-tuning stability (dtype, NaN detection, loss convergence)
-python tests/test_finetune_diagnostics.py
-
-# End-to-end pipeline checks
-pytest tests/ -v -s
-```
