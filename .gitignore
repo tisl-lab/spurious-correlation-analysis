@@ -1,0 +1,24 @@
+# Data and outputs — not published
+data/
+results/
+
+# Bash / shell scripts
+*.sh
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.clip-env/
+venv/
+.venv/
+env/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+.env
+.envrc
