@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument("--data_dir",    type=str, default="./data")
     parser.add_argument("--seed",        type=int, default=42)
     # Fine-tuning controls
-    parser.add_argument("--fine_tune_pct", type=float, default=0.0,
+    parser.add_argument("--fine_tune_pct", type=float, default=0.2,
                         help="Fraction of data used for fine-tuning (rest is test). Default: 0.1")
     parser.add_argument("--ft_epochs",     type=int,   default=3,
                         help="Fine-tuning epochs. Default: 3")
@@ -55,6 +55,13 @@ def parse_args():
                         help="Fine-tune on color-biased splits: digits 0-2→blue, 3-5→green, 6-9→red")
     parser.add_argument("--cb_train_per_digit", type=int, default=100,
                         help="Images per digit used for color-biased fine-tuning. Default: 100")
+    parser.add_argument("--cb_train_all", action="store_true",
+                        help="Use ALL designated-color images from the train split for color-biased FT. "
+                             "Fine-tunes on train=True data, evaluates on a balanced subset of train=False data.")
+    parser.add_argument("--cb_mixed_ft", action="store_true",
+                        help="Mixed color-biased FT: half of training images from the assigned color, "
+                             "half split equally between the other two colors. "
+                             "Uses --cb_train_per_digit as the total count per digit.")
     return parser.parse_args()
 
 
@@ -114,6 +121,122 @@ def color_biased_split(dataset, n_train_per_digit: int, seed: int):
 
         n_test = min(len(p) for p in test_pools.values())
         for c, pool in test_pools.items():
+            chosen = rng.choice(len(pool), size=n_test, replace=False)
+            test_samples.extend(pool[i] for i in chosen)
+
+    train_ds = copy.copy(dataset)
+    test_ds  = copy.copy(dataset)
+    train_ds.samples = train_samples
+    test_ds.samples  = test_samples
+    return train_ds, test_ds
+
+
+def color_biased_all_split(train_dataset, test_dataset, seed: int):
+    """
+    Color-biased fine-tuning using ALL designated-color images from the training split.
+
+    Fine-tuning set: every image in train_dataset whose background color matches the
+    digit's designated color (0-2→blue, 3-5→green, 6-9→red). No cap applied.
+
+    Test set: built from test_dataset with equal counts from all 3 colors per digit
+    (same balancing logic as color_biased_split).
+
+    Returns:
+        (train_ds, test_ds, n_per_digit)  — n_per_digit maps digit → train count
+    """
+    import copy
+    from collections import defaultdict
+
+    rng = np.random.default_rng(seed)
+
+    # ── Training: all designated-color images from the train split ────────────
+    train_samples = []
+    for sample in train_dataset.samples:
+        _, digit, color_name, _ = sample
+        if color_name == DIGIT_TRAIN_COLOR[digit]:
+            train_samples.append(sample)
+
+    n_per_digit = {}
+    for digit in range(10):
+        n_per_digit[digit] = sum(1 for _, d, c, _ in train_samples if d == digit)
+
+    # ── Test: balanced across all 3 colors per digit from the test split ─────
+    buckets = defaultdict(list)
+    for sample in test_dataset.samples:
+        _, digit, color_name, _ = sample
+        buckets[(digit, color_name)].append(sample)
+
+    test_samples = []
+    for digit in range(10):
+        train_color = DIGIT_TRAIN_COLOR[digit]
+        other_colors = [c for c in ("red", "green", "blue") if c != train_color]
+        pools = {c: list(buckets[(digit, c)]) for c in (train_color, *other_colors)}
+        n_test = min(len(p) for p in pools.values())
+        for pool in pools.values():
+            chosen = rng.choice(len(pool), size=n_test, replace=False)
+            test_samples.extend(pool[i] for i in chosen)
+
+    train_ds = copy.copy(train_dataset)
+    test_ds  = copy.copy(test_dataset)
+    train_ds.samples = train_samples
+    test_ds.samples  = test_samples
+    return train_ds, test_ds, n_per_digit
+
+
+def color_biased_mixed_split(dataset, n_train_per_digit: int, seed: int):
+    """
+    Mixed color-biased split: same color-to-digit assignment, but each digit's
+    training set is half from the assigned color and half from the other two colors.
+
+    Per digit:
+        - n_per_other  = n_train_per_digit // 4   (from each non-assigned color)
+        - n_assigned   = n_train_per_digit - 2 * n_per_other  (~half, absorbs rounding)
+
+    Test set: balanced from the images not used for training (equal counts per
+    color per digit), same construction as color_biased_split.
+
+    Returns:
+        (train_ds, test_ds)
+    """
+    import copy
+    from collections import defaultdict
+
+    rng = np.random.default_rng(seed)
+
+    buckets = defaultdict(list)
+    for sample in dataset.samples:
+        _, digit, color_name, _ = sample
+        buckets[(digit, color_name)].append(sample)
+
+    train_samples, test_samples = [], []
+
+    for digit in range(10):
+        train_color = DIGIT_TRAIN_COLOR[digit]
+        other_colors = [c for c in ("red", "green", "blue") if c != train_color]
+
+        n_per_other = n_train_per_digit // 4
+        n_assigned  = n_train_per_digit - 2 * n_per_other  # absorbs rounding
+
+        leftover = {}
+
+        # Assigned color
+        pool = list(buckets[(digit, train_color)])
+        idx  = rng.permutation(len(pool))
+        n_a  = min(n_assigned, len(pool))
+        train_samples.extend(pool[i] for i in idx[:n_a])
+        leftover[train_color] = [pool[i] for i in idx[n_a:]]
+
+        # Each non-assigned color
+        for c in other_colors:
+            pool = list(buckets[(digit, c)])
+            idx  = rng.permutation(len(pool))
+            n_c  = min(n_per_other, len(pool))
+            train_samples.extend(pool[i] for i in idx[:n_c])
+            leftover[c] = [pool[i] for i in idx[n_c:]]
+
+        # Test: balanced from remaining images
+        n_test = min(len(p) for p in leftover.values())
+        for pool in leftover.values():
             chosen = rng.choice(len(pool), size=n_test, replace=False)
             test_samples.extend(pool[i] for i in chosen)
 
@@ -277,6 +400,10 @@ def evaluate(results):
 
 def _exp_tag(args) -> str:
     """Short slug encoding the experiment settings, prepended to every output filename."""
+    if getattr(args, "cb_train_all", False):
+        return f"colorbiased_all_{args.ft_epochs}ep"
+    if getattr(args, "cb_mixed_ft", False):
+        return f"colorbiased_mixed_{args.cb_train_per_digit}pd_{args.ft_epochs}ep"
     if getattr(args, "color_biased_ft", False):
         return f"colorbiased_{args.cb_train_per_digit}pd_{args.ft_epochs}ep"
     elif args.fine_tune_pct > 0:
@@ -342,7 +469,22 @@ def save_report(eval_stats, output_dir, args):
     lines.append("  EXPERIMENT SETTINGS")
     lines.append("  " + "─" * 38)
     lines.append(f"  CLIP model        : {args.clip_model}")
-    if getattr(args, "color_biased_ft", False):
+    if getattr(args, "cb_train_all", False):
+        lines.append(f"  Fine-tune mode    : color-biased ALL  "
+                     f"(0-2→blue, 3-5→green, 6-9→red)")
+        lines.append(f"  Train set         : ALL designated-color images from train split  "
+                     f"({args.ft_epochs} epoch(s), lr={args.ft_lr})")
+        lines.append(f"  Test set          : balanced (equal counts per color per digit, from test split)")
+    elif getattr(args, "cb_mixed_ft", False):
+        n_po = args.cb_train_per_digit // 4
+        n_as = args.cb_train_per_digit - 2 * n_po
+        lines.append(f"  Fine-tune mode    : color-biased MIXED  "
+                     f"(0-2→blue, 3-5→green, 6-9→red)")
+        lines.append(f"  Train per digit   : {args.cb_train_per_digit} total  "
+                     f"({n_as} assigned-color + {n_po} × 2 other colors)  "
+                     f"({args.ft_epochs} epoch(s), lr={args.ft_lr})")
+        lines.append(f"  Test set          : balanced (equal counts per color per digit)")
+    elif getattr(args, "color_biased_ft", False):
         lines.append(f"  Fine-tune mode    : color-biased  "
                      f"(0-2→blue, 3-5→green, 6-9→red)")
         lines.append(f"  Train per digit   : {args.cb_train_per_digit} images  "
@@ -396,6 +538,41 @@ def save_report(eval_stats, output_dir, args):
     return path
 
 
+# ── Misclassified image saver ────────────────────────────────────────────────
+
+def save_misclassified(eval_ds, results, output_dir, args):
+    """
+    For every misclassified image, copy it into:
+        misclassified_<tag>_<ts>/<true_digit>/<predicted_digit>/<filename>
+
+    The folder name mirrors the report filename so results are easy to match.
+    Predictions are in the same order as eval_ds.samples (DataLoader shuffle=False).
+    """
+    import shutil
+
+    preds = results["predictions_shape"]
+    trues = results["true_labels"]
+
+    tag  = _exp_tag(args)
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = os.path.join(output_dir, f"misclassified_{tag}_{ts}")
+
+    n_saved = 0
+    for i, (pred, true) in enumerate(zip(preds, trues)):
+        if pred == true:
+            continue
+        img_path, *_ = eval_ds.samples[i]
+        true_cls = str(int(true))
+        pred_cls = str(int(pred))
+        dest_dir = os.path.join(base, true_cls, pred_cls)
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.copy2(img_path, os.path.join(dest_dir, os.path.basename(img_path)))
+        n_saved += 1
+
+    print(f"  Saved {n_saved} misclassified images → {base}/")
+    return base
+
+
 # ── Visualization ────────────────────────────────────────────────────────────
 
 def visualize_results(eval_stats, results, output_dir, args):
@@ -442,7 +619,11 @@ def visualize_results(eval_stats, results, output_dir, args):
         strength.append(float(valid.max() - valid.min()) if len(valid) >= 2 else 0.0)
 
     # ── Mode label for title ──────────────────────────────────────────────────
-    if getattr(args, "color_biased_ft", False):
+    if getattr(args, "cb_train_all", False):
+        mode = f"Color-Biased FT — ALL training images ({args.ft_epochs} epoch(s))"
+    elif getattr(args, "cb_mixed_ft", False):
+        mode = f"Color-Biased MIXED FT ({args.cb_train_per_digit}/digit, {args.ft_epochs} epoch(s))"
+    elif getattr(args, "color_biased_ft", False):
         mode = f"Color-Biased FT ({args.cb_train_per_digit}/digit, {args.ft_epochs} epoch(s))"
     elif args.fine_tune_pct > 0:
         mode = f"{args.fine_tune_pct*100:.0f}% Random FT ({args.ft_epochs} epoch(s))"
@@ -564,7 +745,52 @@ def main():
                                 max_samples=args.max_samples, seed=args.seed)
     print(f"  Images loaded: {len(full_dataset)}")
 
-    if args.color_biased_ft:
+    if args.cb_mixed_ft:
+        n_per_other = args.cb_train_per_digit // 4
+        n_assigned  = args.cb_train_per_digit - 2 * n_per_other
+        print("\nMixed color-biased fine-tuning split:")
+        print("  digits 0-2  → ~half blue, ~quarter green, ~quarter red")
+        print("  digits 3-5  → ~half green, ~quarter blue, ~quarter red")
+        print("  digits 6-9  → ~half red, ~quarter blue, ~quarter green")
+        print(f"  Per digit: {n_assigned} from assigned color + {n_per_other} from each other color")
+        train_ds, test_ds = color_biased_mixed_split(
+            full_dataset, n_train_per_digit=args.cb_train_per_digit, seed=args.seed)
+        print(f"  Train: {len(train_ds)}  |  Test: {len(test_ds)} (balanced across 3 colors)")
+
+        print(f"\nFine-tuning image encoder ({args.ft_epochs} epoch(s), lr={args.ft_lr})...")
+        clip_model.fine_tune(
+            dataset=train_ds,
+            dataset_name="mnist",
+            epochs=args.ft_epochs,
+            lr=args.ft_lr,
+            batch_size=args.batch_size,
+        )
+        eval_ds = test_ds
+    elif args.cb_train_all:
+        print("\nColor-biased fine-tuning — ALL images from training split:")
+        print("  digits 0-2  → blue backgrounds only")
+        print("  digits 3-5  → green backgrounds only")
+        print("  digits 6-9  → red backgrounds only")
+        train_split = ColoredMNIST(root=args.data_dir, train=True,
+                                   max_samples=args.max_samples, seed=args.seed)
+        print(f"  Training split loaded: {len(train_split)} images")
+        train_ds, test_ds, n_per_digit = color_biased_all_split(
+            train_split, full_dataset, seed=args.seed)
+        print(f"  Train: {len(train_ds)} images (all designated-color from train split)")
+        for digit in range(10):
+            print(f"    digit {digit} ({DIGIT_TRAIN_COLOR[digit]:5s}): {n_per_digit[digit]} images")
+        print(f"  Test:  {len(test_ds)} (balanced across 3 colors, from test split)")
+
+        print(f"\nFine-tuning image encoder ({args.ft_epochs} epoch(s), lr={args.ft_lr})...")
+        clip_model.fine_tune(
+            dataset=train_ds,
+            dataset_name="mnist",
+            epochs=args.ft_epochs,
+            lr=args.ft_lr,
+            batch_size=args.batch_size,
+        )
+        eval_ds = test_ds
+    elif args.color_biased_ft:
         print("\nColor-biased fine-tuning split:")
         print("  digits 0-2  → blue backgrounds only")
         print("  digits 3-5  → green backgrounds only")
@@ -617,6 +843,7 @@ def main():
     print("Saving results...")
     save_csv(eval_stats, args.output_dir, args)
     save_report(eval_stats, args.output_dir, args)
+    save_misclassified(eval_ds, results, args.output_dir, args)
     print("Generating spurious correlation visualization...")
     visualize_results(eval_stats, results, args.output_dir, args)
     print(f"\nAll results in: {os.path.abspath(args.output_dir)}\n")

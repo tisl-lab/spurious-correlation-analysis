@@ -349,7 +349,7 @@ class CLIPZeroShot:
 
         print(f"  Running inference on {len(dataset)} samples...")
         for images, labels, color_names, group_ids in tqdm(loader, desc="Inference"):
-            images = images.squeeze(0).to(self.device)
+            images = images.to(self.device)
 
             # Encode images → L2-normalized feature vector (float32 for MPS dtype safety)
             image_features = self.model.encode_image(images).float()
