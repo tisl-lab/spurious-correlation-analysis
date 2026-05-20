@@ -1,14 +1,13 @@
 import os
 import shutil
 
+# IMPORTANT
 # The MiniImageNet dataset must be downloaded from [here](https://drive.google.com/open?id=1HkgrkAwukzEZA0TpO7010PkAOREb2Nuk)
 # -(see this [Github Issue](https://github.com/dragen1860/LearningToCompare-Pytorch/issues/4) for more details).
 
-SRC = f"{os.environ['HOME']}/Downloads/mini-imagenet/images"
+SRC = os.path.join(os.environ['HOME'], "Downloads", "mini-imagenet", "images")
 DEST = os.path.join(os.path.abspath(os.path.dirname(__file__)), "miniimagenet")
 
-print(SRC)
-print(DEST)
 print(f"Copying Miniimagenet from {SRC} to {DEST}")
 
 class_numbers = [
