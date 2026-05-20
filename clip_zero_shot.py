@@ -111,6 +111,24 @@ CIFAR10_COLOR_PROMPTS = {
     9: "a photo of a vehicle on a land or road background",        # truck → land
 }
 
+# Spawrious-224: breed classification prompts (shape = true label)
+SPAWRIOUS224_SHAPE_PROMPTS = {
+    0: "a photo of a bulldog",
+    1: "a photo of a corgi",
+    2: "a photo of a dachshund",
+    3: "a photo of a labrador",
+}
+
+# Spawrious-224: background-based prompts (spurious feature)
+SPAWRIOUS224_BACKGROUND_PROMPTS = {
+    0: "a photo of a dog on a beach",
+    1: "a photo of a dog in a desert",
+    2: "a photo of a dog on dirt ground",
+    3: "a photo of a dog in a jungle",
+    4: "a photo of a dog on a mountain",
+    5: "a photo of a dog in snow",  
+}
+
 PROMPT_SETS = {
     "mnist": {
         "shape": MNIST_SHAPE_PROMPTS,
@@ -119,7 +137,11 @@ PROMPT_SETS = {
     "cifar10": {
         "shape": CIFAR10_SHAPE_PROMPTS,
         "color": CIFAR10_COLOR_PROMPTS,
-    }
+    },
+    "spawrious224": {
+        "shape": SPAWRIOUS224_SHAPE_PROMPTS,
+        "color": SPAWRIOUS224_BACKGROUND_PROMPTS,
+    },
 }
 
 
@@ -188,7 +210,7 @@ class CLIPZeroShot:
 
         Args:
             dataset      : ColoredMNIST instance (train split)
-            dataset_name : "mnist" or "cifar10"
+            dataset_name : "mnist" or "cifar10" or "spawrious224"
             epochs       : number of passes over the training data
             lr           : learning rate for Adam (keep small, e.g. 1e-5)
             batch_size   : training batch size
@@ -292,7 +314,7 @@ class CLIPZeroShot:
             dataset      : ColoredMNIST or ColoredCIFAR10 instance
                            (will have clip_preprocess injected automatically)
             prompt_mode  : "shape", "color", or "both"
-            dataset_name : "mnist" or "cifar10"
+            dataset_name : "mnist" or "cifar10" or "spawrious224"
             batch_size   : inference batch size
 
         Returns:
