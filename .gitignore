@@ -1,5 +1,6 @@
 # Data and outputs — not published
 data/
+datasets/miniimagenet/n*
 results/
 
 # Bash / shell scripts
