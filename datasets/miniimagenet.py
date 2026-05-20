@@ -128,6 +128,13 @@ MINI_IMAGENET_CLS_TO_IMAGENET_NAME = [
 ]
 
 
+SEMANTIC_SUBSETS_CLASSES = {
+    "birds": [0, 1, 5, 6],
+    "canidea": [20, 21, 22, 24, 26],
+    "insects": [4, 29, 30, 31],
+}
+
+
 def get_miniimagenet_dataset(imsize=(224, 224)):
 
     input_transform = \
