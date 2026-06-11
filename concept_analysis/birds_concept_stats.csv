@@ -1,0 +1,56 @@
+# Concept Distribution Analysis: BIRDS
+# Concepts: high_freq_sky_patterns, image_edge, wood, fence
+# Target classes: goose, house_finch, robin, toucan
+
+## Per-Class Concept Counts
+class,is_target,high_freq_sky_patterns,image_edge,wood,fence,total_with_concepts
+goose,yes,87,41,9,5,130
+house_finch,yes,100,63,31,25,199
+robin,yes,73,72,35,15,177
+toucan,yes,37,65,31,117,227
+harvestman,no,0,1,0,0,1
+worm_fence,no,1,0,5,2,7
+
+## Exact Concept Combination Counts (per class)
+class,fence,high_freq_sky_patterns,image_edge,wood,fence+high_freq_sky_patterns,fence+image_edge,fence+wood,high_freq_sky_patterns+image_edge,high_freq_sky_patterns+wood,image_edge+wood,high_freq_sky_patterns+image_edge+wood
+goose,5,76,31,6,0,0,0,9,2,1,0
+house_finch,20,87,49,24,0,1,4,11,1,1,1
+robin,12,61,57,30,1,1,1,10,0,3,1
+toucan,101,29,54,20,2,5,9,5,1,1,0
+harvestman,0,0,1,0,0,0,0,0,0,0,0
+worm_fence,2,0,0,4,0,0,0,0,1,0,0
+
+## Images with Exactly k Concepts (global, all classes)
+k,count
+1,669
+2,70
+3,2
+
+## At-Least Combo Counts (global)
+
+### Size-1 combinations
+combo,count
+high_freq_sky_patterns,298
+image_edge,242
+fence,164
+wood,111
+
+### Size-2 combinations
+combo,count
+high_freq_sky_patterns+image_edge,37
+fence+wood,14
+image_edge+wood,8
+high_freq_sky_patterns+wood,7
+fence+image_edge,7
+fence+high_freq_sky_patterns,3
+
+### Size-3 combinations
+combo,count
+high_freq_sky_patterns+image_edge+wood,2
+fence+high_freq_sky_patterns+image_edge,0
+fence+high_freq_sky_patterns+wood,0
+fence+image_edge+wood,0
+
+### Size-4 combinations
+combo,count
+fence+high_freq_sky_patterns+image_edge+wood,0

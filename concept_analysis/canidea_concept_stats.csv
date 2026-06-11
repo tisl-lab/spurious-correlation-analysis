@@ -1,0 +1,54 @@
+# Concept Distribution Analysis: CANIDEA
+# Concepts: human, snow, fence
+# Target classes: Arctic_fox, Newfoundland, Tibetan_mastiff, boxer, dalmatian, golden_retriever, malamute, white_wolf
+
+## Per-Class Concept Counts
+class,is_target,human,snow,fence,total_with_concepts
+Arctic_fox,yes,4,138,41,179
+Newfoundland,yes,90,31,4,120
+Tibetan_mastiff,yes,7,1,3,11
+boxer,yes,81,8,11,95
+dalmatian,yes,125,56,30,193
+golden_retriever,yes,2,0,0,2
+malamute,yes,1,0,0,1
+white_wolf,yes,17,111,42,165
+black-footed_ferret,no,0,0,1,1
+miniskirt,no,1,0,0,1
+reel,no,1,0,0,1
+
+## Exact Concept Combination Counts (per class)
+class,fence,human,snow,fence+human,fence+snow,human+snow
+Arctic_fox,37,4,134,0,4,0
+Newfoundland,2,85,28,2,0,3
+Tibetan_mastiff,3,7,1,0,0,0
+boxer,9,76,5,2,0,3
+dalmatian,22,108,45,7,1,10
+golden_retriever,0,2,0,0,0,0
+malamute,0,1,0,0,0,0
+white_wolf,37,16,107,1,4,0
+black-footed_ferret,1,0,0,0,0,0
+miniskirt,0,1,0,0,0,0
+reel,0,1,0,0,0,0
+
+## Images with Exactly k Concepts (global, all classes)
+k,count
+1,732
+2,37
+
+## At-Least Combo Counts (global)
+
+### Size-1 combinations
+combo,count
+snow,345
+human,329
+fence,132
+
+### Size-2 combinations
+combo,count
+human+snow,16
+fence+human,12
+fence+snow,9
+
+### Size-3 combinations
+combo,count
+fence+human+snow,0

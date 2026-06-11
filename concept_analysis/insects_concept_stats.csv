@@ -1,0 +1,37 @@
+# Concept Distribution Analysis: INSECTS
+# Concepts: leaves, hands
+# Target classes: ant, harvestman, ladybug, rhinoceros_beetle
+
+## Per-Class Concept Counts
+class,is_target,leaves,hands,total_with_concepts
+ant,yes,101,4,105
+harvestman,yes,200,1,201
+ladybug,yes,254,8,262
+rhinoceros_beetle,yes,26,50,75
+African_hunting_dog,no,1,0,1
+spider_web,no,2,0,2
+
+## Exact Concept Combination Counts (per class)
+class,hands,leaves,hands+leaves
+ant,4,101,0
+harvestman,1,200,0
+ladybug,8,254,0
+rhinoceros_beetle,49,25,1
+African_hunting_dog,0,1,0
+spider_web,0,2,0
+
+## Images with Exactly k Concepts (global, all classes)
+k,count
+1,645
+2,1
+
+## At-Least Combo Counts (global)
+
+### Size-1 combinations
+combo,count
+leaves,584
+hands,63
+
+### Size-2 combinations
+combo,count
+hands+leaves,1
