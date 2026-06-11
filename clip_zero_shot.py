@@ -119,6 +119,11 @@ SPAWRIOUS224_SHAPE_PROMPTS = {
     3: "a photo of a labrador",
 }
 
+WATERBIRDS_SHAPE_PROMPTS = {
+    0: "a photo of a landbird",
+    1: "a photo of a waterbird",
+}
+
 # Spawrious-224: background-based prompts (spurious feature)
 SPAWRIOUS224_BACKGROUND_PROMPTS = {
     0: "a photo of a dog on a beach",
@@ -128,6 +133,26 @@ SPAWRIOUS224_BACKGROUND_PROMPTS = {
     4: "a photo of a dog on a mountain",
     5: "a photo of a dog in snow",  
 }
+
+# MINIIMAGENET_SHAPE_PROMPTS = {
+#     0: "a photo of a bird",
+#     1: "a photo of an insect",
+#     2: "a photo of a flower",
+#     3: "a photo of a fruit",
+#     4: "a photo of a domestic animal",
+#     5: "a photo of a wild animal",
+    
+# }
+# MINIIMAGENET_BACKGROUND_PROMPTS = {
+#     0: "a photo of a bird in the sky",
+#     1: "a photo of an insect on a leaf",
+#     2: "a photo of a flower in a garden",
+#     3: "a photo of a fruit on a tree",
+#     4: "a photo of an animal in the wild",
+#     5: "a photo of an animal in the farm",
+#     6: "a photo of an insect on a hand",
+#     7: " a photo of an animal in a zoo",   
+# }
 
 PROMPT_SETS = {
     "mnist": {
@@ -142,6 +167,15 @@ PROMPT_SETS = {
         "shape": SPAWRIOUS224_SHAPE_PROMPTS,
         "color": SPAWRIOUS224_BACKGROUND_PROMPTS,
     },
+    "waterbirds": {
+        "shape": WATERBIRDS_SHAPE_PROMPTS,
+        "color": {},
+    },
+    # "miniimagenet": {
+    #     "shape": MINIIMAGENET_SHAPE_PROMPTS,
+    #     "color": MINIIMAGENET_BACKGROUND_PROMPTS,
+    # },
+                  
 }
 
 
@@ -232,7 +266,6 @@ class CLIPZeroShot:
         shape_prompts = PROMPT_SETS[dataset_name]["shape"]
         with torch.no_grad():
             text_features = self.encode_text_prompts(shape_prompts).float()  # (C, D)
-
         # MPS has known autograd bugs with transformer backpropagation that produce
         # NaN gradients and crash on the second epoch. Fine-tune on CPU instead;
         # the model is moved back to MPS afterwards for fast inference.
@@ -405,6 +438,39 @@ class CLIPZeroShot:
             results["color_prompts"]     = color_prompts
 
         return results
+
+    def save_model(self, path: str, metadata: dict = None):
+        """
+        Save the (fine-tuned) model to a .pt file.
+
+        Reload with:
+            clip_ft = CLIPZeroShot.load_model("path/to/file.pt", device="cpu")
+        """
+        payload = {
+            "model_name": self.model_name,
+            "state_dict": self.model.state_dict(),
+        }
+        if metadata:
+            payload["metadata"] = metadata
+        torch.save(payload, path)
+        print(f"  Model saved: {path}")
+
+    @classmethod
+    def load_model(cls, path: str, device: str = None):
+        """
+        Restore a CLIPZeroShot from a file saved with save_model().
+
+        Example:
+            clip_ft = CLIPZeroShot.load_model("clip_ft_BIASED_100_....pt")
+            results = clip_ft.run(test_ds, prompt_mode="shape", dataset_name="waterbirds")
+        """
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        instance = cls(model_name=payload["model_name"], device=device)
+        instance.model.load_state_dict(payload["state_dict"])
+        instance.model.eval()
+        if "metadata" in payload:
+            print(f"  Loaded metadata: {payload['metadata']}")
+        return instance
 
     @staticmethod
     def _collate_fn(batch):
