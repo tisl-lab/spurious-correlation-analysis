@@ -29,7 +29,7 @@ import argparse
 import glob
 import os
 import sys
-
+import inspect  ## for context_decorator for ablation hooks
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _PROJECT_ROOT)
@@ -684,20 +684,28 @@ def plot_concept_top_images(
     te_paths, ft_paths,
     te_reps_np, ft_reps_np,
     test_save_dir, ft_save_dir,
+    te_row_title="Test (misclassified)",
+    ft_row_title="FT set",
+    te_labels=None,
+    ft_labels=None,
 ):
     """
     Saves two separate plots — one per split — into their respective folders:
       test_save_dir/concept_{cid}_{cname}.png  (misclassified test images)
       ft_save_dir/concept_{cid}_{cname}.png    (ft images)
     Each plot is a 1-row × 10-col grid sorted by concept activation descending.
+
+    te_labels / ft_labels: optional list of per-image label strings (same length
+      as top10_te_indices / top10_ft_indices). When provided, each image subtitle
+      becomes "<label>\\n<activation>".
     """
     import matplotlib.pyplot as plt
     from PIL import Image as _PIL
 
     plot_paths = []
-    for indices, paths_list, reps, row_title, save_dir in [
-        (top10_te_indices, te_paths, te_reps_np, "Test (misclassified)", test_save_dir),
-        (top10_ft_indices, ft_paths, ft_reps_np, "FT set",               ft_save_dir),
+    for indices, paths_list, reps, row_title, save_dir, img_labels in [
+        (top10_te_indices, te_paths, te_reps_np, te_row_title, test_save_dir, te_labels),
+        (top10_ft_indices, ft_paths, ft_reps_np, ft_row_title, ft_save_dir, ft_labels),
     ]:
         n_cols = max(len(indices), 1)
         fig, axes = plt.subplots(1, n_cols, figsize=(2.2 * n_cols, 3))
@@ -714,7 +722,9 @@ def plot_concept_top_images(
                 idx = indices[col]
                 act = reps[idx, cid]
                 ax.imshow(_PIL.open(paths_list[idx]).convert("RGB"))
-                ax.set_title(f"{act:.3f}", fontsize=7, pad=2)
+                lbl = img_labels[col] if img_labels is not None and col < len(img_labels) else ""
+                title = f"{lbl}\n{act:.3f}" if lbl else f"{act:.3f}"
+                ax.set_title(title, fontsize=7, pad=2)
         plt.tight_layout()
         plot_path = os.path.join(save_dir, f"concept_{cid}_{cname}.png")
         plt.savefig(plot_path, bbox_inches="tight", dpi=120)
@@ -725,12 +735,238 @@ def plot_concept_top_images(
 
 
 def analyze_misclassified_concepts(
-    te_results, ft_results, test_ds,
+    te_results, ft_results, test_ds, ft_ds,
     concept_match_scores, vocab_names,
     sae_dir, clip_ft,
     activation_threshold=None,
     prevalence_threshold=0.90,
-    top_n_concepts=5,
+    top_n_concepts=20,
+):
+    """
+    Standalone experiment: for each misaligned group (1 = landbird/water,
+    2 = waterbird/land) in the test set, identify which images are misclassified
+    by the fine-tuned CLIP model, then find SAE concepts that fire above threshold
+    in more than `prevalence_threshold` of those misclassified images.
+
+    Outputs
+    -------
+    Report  : sae_dir/misclassified_concepts_report.txt
+    Images  : sae_dir/test_images/{group_folder}/{cid}-{cname}/   ← misclassified test images
+              sae_dir/ft_images/{class_folder}/{cid}-{cname}/     ← ft-set images activating concept
+    """
+    import shutil
+
+    te_reps    = te_results["sae_representations"]   # (N_te, L)
+    te_paths   = te_results["image_paths"]
+    ft_reps    = ft_results["sae_representations"]   # (N_ft, L)
+    ft_paths   = ft_results["image_paths"]
+    te_reps_np = te_reps.cpu().numpy()
+    ft_reps_np = ft_reps.cpu().numpy()
+
+    if activation_threshold is None:
+        activation_threshold = float(te_reps_np.mean())
+        print(f"  activation_threshold (mean): {activation_threshold:.6f}")
+
+    group_ids_arr = np.array([s[3] for s in test_ds.samples])
+
+    # Test-set misaligned groups: 2 = landbird/water bg, 3 = waterbird/land bg
+    # FT set contains only aligned groups (landbird/land and waterbird/water)
+    MISALIGNED_GROUP_NAMES = {
+        1: "landbird / water bg",
+        2: "waterbird / land bg",
+    }
+    GROUP_FOLDER     = {1: "land_bird_on_water", 2: "water_bird_on_land"}
+    FT_CLASS_FOLDER  = {1: "water_birds",         2: "land_birds"}
+
+    report_lines = [
+        "Misclassified Image Concept Analysis",
+        f"Threshold: activation > {activation_threshold:.6f}  |  "
+        f"Prevalence > {prevalence_threshold * 100:.0f}%  |  Top {top_n_concepts} concepts",
+        "=" * 80,
+    ]
+    
+
+
+
+
+    all_concepts           = []
+    concept_source_group   = {}   # cid → gid_mis that contributed it
+    concept_mis_prevalence = {}   # cid → prevalence in that misaligned group
+    for gid_mis in [1, 2]:
+        g_indices   = np.where(group_ids_arr == gid_mis)[0]
+
+        # ── Build a group-filtered dataset with the same structure as test_ds ──
+        group_ds = ManifestDataset.__new__(ManifestDataset)
+        group_ds.samples         = [test_ds.samples[i] for i in g_indices]
+        group_ds.clip_preprocess = clip_ft.preprocess
+        group_ds.manifest_path   = test_ds.manifest_path
+
+        # ── Classify all images in the group via clip_ft.run() ──────────────
+        print(f"\nClassifying Group {gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — {len(g_indices)} images …")
+        zs_stats      = clip_ft.run(dataset=group_ds, prompt_mode="shape",
+                                    dataset_name="waterbirds")
+        mis_local     = np.where(
+            np.array(zs_stats["predictions_shape"]) != np.array(zs_stats["true_labels"])
+        )[0]
+        misclassified = g_indices[mis_local].tolist()
+        n_mis         = len(misclassified)
+        print(f"  Misclassified: {n_mis} / {len(g_indices)}")
+
+        report_lines.append(
+            f"\n{'─'*80}\n"
+            f"Group {gid_mis} — {MISALIGNED_GROUP_NAMES[gid_mis]}\n"
+            f"Misclassified: {n_mis} / {len(g_indices)}"
+        )
+
+        if n_mis == 0:
+            report_lines.append("  No misclassified images — skipping.")
+            continue
+
+         
+
+        # ── Concept prevalence among misclassified images ────────────────────
+        mis_reps = te_reps_np[misclassified]                          # (n_mis, L)
+        prev     = (mis_reps > activation_threshold).sum(axis=0) / n_mis  # (L,) fraction
+
+        eligible = np.where(prev > prevalence_threshold)[0]
+        if len(eligible) == 0:
+            report_lines.append(
+                f"  No concepts exceed {prevalence_threshold*100:.0f}% prevalence — skipping."
+            )
+            continue
+
+        top_concepts = eligible[np.argsort(prev[eligible])[::-1]][:top_n_concepts]
+        all_concepts.extend(top_concepts.tolist())
+        for cid in top_concepts.tolist():
+            concept_source_group[cid]   = gid_mis
+            concept_mis_prevalence[cid] = float(prev[cid])
+        # ── Report section for this group ────────────────────────────────────
+        report_lines.append(
+            f"Concepts with prevalence > {prevalence_threshold*100:.0f}%: "
+            f"{len(eligible)} found, top {top_n_concepts} shown\n"
+        )
+        report_lines.append(
+            f"{'Concept ID':<12}  {'Concept Name':<30}  {'Prevalence':>12}  {'# Images':>10}"
+        )
+        report_lines.append("-" * 70)
+        for cid in top_concepts:
+            cname   = vocab_names[concept_match_scores[:, cid].argmax()]
+            n_act   = int((mis_reps[:, cid] > activation_threshold).sum())
+            report_lines.append(
+                f"{cid:<12}  {cname:<30}  {prev[cid]*100:>11.1f}%  {n_act:>10}"
+            )
+
+        # ── Save images per concept ──────────────────────────────────────────
+        group_folder    = GROUP_FOLDER[gid_mis]
+        ft_class_folder = FT_CLASS_FOLDER[gid_mis]
+
+        for cid in top_concepts:
+            cname              = vocab_names[concept_match_scores[:, cid].argmax()]
+
+            # test_images/{group_folder}/{cid}-{cname}/
+            test_out = os.path.join(sae_dir, "test_images", group_folder)
+            os.makedirs(test_out, exist_ok=True)
+            active_mis = sorted(
+                [idx for idx in misclassified if te_reps_np[idx, cid] > activation_threshold],
+                key=lambda idx: te_reps_np[idx, cid], reverse=True,
+            )
+            for idx in active_mis[:10]:
+                shutil.copy2(te_paths[idx],
+                             os.path.join(test_out, os.path.basename(te_paths[idx])))
+
+            # ft_images/{ft_class_folder}/{cid}-{cname}/
+            ft_out = os.path.join(sae_dir, "ft_images", ft_class_folder)
+            os.makedirs(ft_out, exist_ok=True)
+            active_ft = sorted(
+                [i for i, _ in enumerate(ft_paths) if ft_reps_np[i, cid] > activation_threshold],
+                key=lambda i: ft_reps_np[i, cid], reverse=True,
+            )
+            for i in active_ft[:10]:
+                shutil.copy2(ft_paths[i], os.path.join(ft_out, os.path.basename(ft_paths[i])))
+
+            plot_path = plot_concept_top_images(
+                cid=cid, cname=cname,
+                group_label=f"Grp{gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]})",
+                top10_te_indices=active_mis[:10],
+                top10_ft_indices=active_ft[:10],
+                te_paths=te_paths, ft_paths=ft_paths,
+                te_reps_np=te_reps_np, ft_reps_np=ft_reps_np,
+                test_save_dir=test_out, ft_save_dir=ft_out,
+            )
+            print(f"  Concept {cid} [{cname}]: "
+                  f"test→{test_out}  ft→{ft_out}  plot→{plot_path}")
+
+            # ── Lowest-activation images — saved by each image's actual group ──
+            _te_grp_folders = {
+                0: "landbird_land_bg", 1: "landbird_water_bg",
+                2: "waterbird_land_bg", 3: "waterbird_water_bg",
+            }
+            _ft_lbl_folders = {0: "land_birds", 1: "water_birds"}
+
+            bottom_te = np.argsort(te_reps_np[:, cid])[:10]
+            bottom_ft = np.argsort(ft_reps_np[:, cid])[:10]
+
+            for idx in bottom_te:
+                actual_gid    = test_ds.samples[idx][3]
+                actual_folder = _te_grp_folders.get(actual_gid, f"group_{actual_gid}")
+                dest = os.path.join(sae_dir, "test_images", "lowest", actual_folder)
+                os.makedirs(dest, exist_ok=True)
+                shutil.copy2(te_paths[idx],
+                             os.path.join(dest, os.path.basename(te_paths[idx])))
+
+            for i in bottom_ft:
+                actual_label  = ft_ds.samples[i][1]
+                actual_folder = _ft_lbl_folders.get(actual_label, f"label_{actual_label}")
+                dest = os.path.join(sae_dir, "ft_images", "lowest", actual_folder)
+                os.makedirs(dest, exist_ok=True)
+                shutil.copy2(ft_paths[i],
+                             os.path.join(dest, os.path.basename(ft_paths[i])))
+
+            te_labels_low = [
+                _te_grp_folders.get(test_ds.samples[idx][3], f"grp{test_ds.samples[idx][3]}")
+                for idx in bottom_te
+            ]
+            ft_labels_low = [
+                _ft_lbl_folders.get(ft_ds.samples[i][1], f"lbl{ft_ds.samples[i][1]}")
+                for i in bottom_ft
+            ]
+
+            test_plot_dir = os.path.join(sae_dir, "test_images", "lowest", "plots")
+            ft_plot_dir   = os.path.join(sae_dir, "ft_images",   "lowest", "plots")
+            os.makedirs(test_plot_dir, exist_ok=True)
+            os.makedirs(ft_plot_dir,   exist_ok=True)
+            low_plot_path = plot_concept_top_images(
+                cid=cid, cname=cname,
+                group_label=f"Grp{gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — Lowest",
+                top10_te_indices=bottom_te.tolist(),
+                top10_ft_indices=bottom_ft.tolist(),
+                te_paths=te_paths, ft_paths=ft_paths,
+                te_reps_np=te_reps_np, ft_reps_np=ft_reps_np,
+                test_save_dir=test_plot_dir, ft_save_dir=ft_plot_dir,
+                te_row_title="Test (all) — lowest activation",
+                ft_row_title="FT set — lowest activation",
+                te_labels=te_labels_low,
+                ft_labels=ft_labels_low,
+            )
+            print(f"  Concept {cid} [{cname}] lowest: "
+                  f"test→test_images/lowest/*  ft→ft_images/lowest/*  plot→{low_plot_path}")
+
+    report_text = "\n".join(report_lines) + "\n"
+    report_path = os.path.join(sae_dir, "misclassified_concepts_report.txt")
+    with open(report_path, "w") as f:
+        f.write(report_text)
+    print(f"\nMisclassified concept report saved to {report_path}")
+    return all_concepts, concept_source_group, concept_mis_prevalence
+
+
+
+def find_spurious_concepts(
+    te_results, ft_results, test_ds, ft_ds,
+    concept_match_scores, vocab_names,
+    sae_dir, clip_ft,
+    activation_threshold=None,
+    prevalence_threshold=0.90,
+    top_n_concepts=20,
 ):
     """
     Standalone experiment: for each misaligned group (1 = landbird/water,
@@ -780,6 +1016,11 @@ def analyze_misclassified_concepts(
 
 
 
+    all_candidate_concepts  = []
+    concept_source_group    = {}   # cid → gid_mis that contributed it
+    concept_mis_prevalence  = {}   # cid → prevalence in that misaligned group
+    group_top_sets   = {}
+    group_prevalence = {}
     for gid_mis in [1, 2]:
         g_indices   = np.where(group_ids_arr == gid_mis)[0]
 
@@ -796,9 +1037,18 @@ def analyze_misclassified_concepts(
         mis_local     = np.where(
             np.array(zs_stats["predictions_shape"]) != np.array(zs_stats["true_labels"])
         )[0]
-        misclassified = g_indices[mis_local].tolist()
-        n_mis         = len(misclassified)
+        
+        correct_local = np.where(
+            np.array(zs_stats["predictions_shape"]) == np.array(zs_stats["true_labels"])
+        )[0]
+        
+
+        misclassified        = g_indices[mis_local].tolist()
+        correctly_classified = g_indices[correct_local].tolist()
+        n_mis                = len(misclassified)
+        n_correct            = len(correctly_classified)
         print(f"  Misclassified: {n_mis} / {len(g_indices)}")
+        print(f"  Correctly classified: {n_correct} / {len(g_indices)}")
 
         report_lines.append(
             f"\n{'─'*80}\n"
@@ -813,8 +1063,9 @@ def analyze_misclassified_concepts(
 
 
         # ── Concept prevalence among misclassified images ────────────────────
-        mis_reps = te_reps_np[misclassified]                          # (n_mis, L)
-        prev     = (mis_reps > activation_threshold).sum(axis=0) / n_mis  # (L,) fraction
+        mis_reps  = te_reps_np[misclassified]                               # (n_mis, L)
+        prev      = (mis_reps > activation_threshold).sum(axis=0) / n_mis  # (L,) fraction — for filtering & diff
+        mean_prev = mis_reps.mean(axis=0)                                   # (L,) mean activation — for ranking
 
         eligible = np.where(prev > prevalence_threshold)[0]
         if len(eligible) == 0:
@@ -823,9 +1074,50 @@ def analyze_misclassified_concepts(
             )
             continue
 
-        top_concepts = eligible[np.argsort(prev[eligible])[::-1]][:top_n_concepts]
+        # rank eligible concepts by mean activation (captures both magnitude and frequency)
+        pool_size    = int(len(eligible) * .3) # int(len(eligible) * .3) #len(eligible) # if len(eligible) < 3 else int(len(eligible) * .3)
+        # top_concepts = eligible[np.argsort(mean_prev[eligible])[::-1]][:top_n_concepts]  # for report
+        mis_pool     = set(eligible[np.argsort(mean_prev[eligible])[::-1]][:pool_size].tolist())
 
-        # ── Report section for this group ────────────────────────────────────
+        # ── Aligned group definitions ────────────────────────────────────────
+        # gid_mis=1 (landbird/water bg): HIGH in group 3 (waterbird/water, same bg)
+        #                                LOW  in group 0 (landbird/land)
+        # gid_mis=2 (waterbird/land bg): HIGH in group 0 (landbird/land, same bg)
+        #                                LOW  in group 3 (waterbird/water)
+        _aligned_high = {1: 3, 2: 0}
+        _aligned_low  = {1: 0, 2: 3}
+        high_reps = te_reps_np[group_ids_arr == _aligned_high[gid_mis]]
+        low_reps  = te_reps_np[group_ids_arr == _aligned_low[gid_mis]]
+
+        # ── Candidate concepts: top-in-misclassified ∩ low-in-aligned-low-group ──
+        low_aligned_mean = low_reps.mean(axis=0)
+        low_aligned_pool = set(np.argsort(low_aligned_mean)[:pool_size].tolist())
+
+        candidate_concepts = list(mis_pool & low_aligned_pool)
+        if not candidate_concepts:
+            candidate_concepts = list(mis_pool)
+            print("  No mis∩low_aligned intersection — using top misclassified pool.")
+        candidate_concepts = sorted(candidate_concepts, key=lambda c: prev[c], reverse=True)
+        all_candidate_concepts.extend(candidate_concepts)
+        for cid in candidate_concepts:
+            concept_source_group[cid]   = gid_mis
+            concept_mis_prevalence[cid] = float(prev[cid])
+
+        # ── Re-rank candidates by prevalence in the aligned groups ──────────
+
+        aligned_scores = []
+        for cid in candidate_concepts:
+            prev_high = (high_reps[:, cid] > activation_threshold).sum() / len(high_reps)
+            prev_low  = (low_reps[:, cid] > activation_threshold).sum() / len(low_reps)
+            # mean_low  = float(low_reps[:, cid].mean())   # low activation value, not count
+            aligned_scores.append((cid, prev_high - prev_low))
+
+        aligned_scores.sort(key=lambda x: x[1], reverse=True)
+        #### top_concepts are the most spurious concepts that are both prevalent in misclassified images and low in the aligned low-bg group
+        top_concepts = [cid for cid, _ in aligned_scores[:top_n_concepts]]
+        group_top_sets[gid_mis]   = set(top_concepts)
+        group_prevalence[gid_mis] = {c: float(prev[c]) for c in top_concepts}
+
         report_lines.append(
             f"Concepts with prevalence > {prevalence_threshold*100:.0f}%: "
             f"{len(eligible)} found, top {top_n_concepts} shown\n"
@@ -847,10 +1139,9 @@ def analyze_misclassified_concepts(
 
         for cid in top_concepts:
             cname              = vocab_names[concept_match_scores[:, cid].argmax()]
-            concept_folder_name = f"{cid}-{cname}"
 
             # test_images/{group_folder}/{cid}-{cname}/
-            test_out = os.path.join(sae_dir, "test_images", group_folder)
+            test_out = os.path.join(sae_dir, "test_images", "spurious", group_folder)
             os.makedirs(test_out, exist_ok=True)
             active_mis = sorted(
                 [idx for idx in misclassified if te_reps_np[idx, cid] > activation_threshold],
@@ -861,7 +1152,7 @@ def analyze_misclassified_concepts(
                              os.path.join(test_out, os.path.basename(te_paths[idx])))
 
             # ft_images/{ft_class_folder}/{cid}-{cname}/
-            ft_out = os.path.join(sae_dir, "ft_images", ft_class_folder)
+            ft_out = os.path.join(sae_dir, "ft_images", "spurious", ft_class_folder)
             os.makedirs(ft_out, exist_ok=True)
             active_ft = sorted(
                 [i for i, _ in enumerate(ft_paths) if ft_reps_np[i, cid] > activation_threshold],
@@ -882,11 +1173,404 @@ def analyze_misclassified_concepts(
             print(f"  Concept {cid} [{cname}]: "
                   f"test→{test_out}  ft→{ft_out}  plot→{plot_path}")
 
+            _te_grp_folders = {
+                0: "landbird_land_bg", 1: "landbird_water_bg",
+                2: "waterbird_land_bg", 3: "waterbird_water_bg",
+            }
+            _ft_lbl_folders = {0: "land_birds", 1: "water_birds"}
+
+            bottom_te = np.argsort(te_reps_np[:, cid])[:10]
+            bottom_ft = np.argsort(ft_reps_np[:, cid])[:10]
+
+            for idx in bottom_te:
+                actual_gid    = test_ds.samples[idx][3]
+                actual_folder = _te_grp_folders.get(actual_gid, f"group_{actual_gid}")
+                dest = os.path.join(sae_dir, "test_images", "lowest", actual_folder)
+                os.makedirs(dest, exist_ok=True)
+                shutil.copy2(te_paths[idx],
+                             os.path.join(dest, os.path.basename(te_paths[idx])))
+
+            for i in bottom_ft:
+                actual_label  = ft_ds.samples[i][1]
+                actual_folder = _ft_lbl_folders.get(actual_label, f"label_{actual_label}")
+                dest = os.path.join(sae_dir, "ft_images", "lowest", actual_folder)
+                os.makedirs(dest, exist_ok=True)
+                shutil.copy2(ft_paths[i],
+                             os.path.join(dest, os.path.basename(ft_paths[i])))
+
+            te_labels_low = [
+                _te_grp_folders.get(test_ds.samples[idx][3], f"grp{test_ds.samples[idx][3]}")
+                for idx in bottom_te
+            ]
+            ft_labels_low = [
+                _ft_lbl_folders.get(ft_ds.samples[i][1], f"lbl{ft_ds.samples[i][1]}")
+                for i in bottom_ft
+            ]
+
+            test_plot_dir = os.path.join(sae_dir, "test_images", "lowest", "plots")
+            ft_plot_dir   = os.path.join(sae_dir, "ft_images",   "lowest", "plots")
+            os.makedirs(test_plot_dir, exist_ok=True)
+            os.makedirs(ft_plot_dir,   exist_ok=True)
+            low_plot_path = plot_concept_top_images(
+                cid=cid, cname=cname,
+                group_label=f"Grp{gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — Lowest",
+                top10_te_indices=bottom_te.tolist(),
+                top10_ft_indices=bottom_ft.tolist(),
+                te_paths=te_paths, ft_paths=ft_paths,
+                te_reps_np=te_reps_np, ft_reps_np=ft_reps_np,
+                test_save_dir=test_plot_dir, ft_save_dir=ft_plot_dir,
+                te_row_title="Test (all) — lowest activation",
+                ft_row_title="FT set — lowest activation",
+                te_labels=te_labels_low,
+                ft_labels=ft_labels_low,
+            )
+            print(f"  Concept {cid} [{cname}] lowest: "
+                  f"test→test_images/lowest/*  ft→ft_images/lowest/*  plot→{low_plot_path}")
+
+    # ── Build aligned-group sets so intersection logic works in plot functions ─
+    # pairs: gid_mis=1 ↔ gid_aln=3,  gid_mis=2 ↔ gid_aln=0
+    for gid_aln, gid_mis_pair in [(3, 1), (0, 2)]:
+        paired = group_top_sets.get(gid_mis_pair, set())
+        group_top_sets[gid_aln] = paired
+        aln_reps = te_reps_np[group_ids_arr == gid_aln]
+        group_prevalence[gid_aln] = (
+            {c: float((aln_reps[:, c] > activation_threshold).mean()) for c in paired}
+            if len(aln_reps) else {}
+        )
+
+    device         = next(clip_ft.model.parameters()).device
+    group_ids_list = [s[3] for s in test_ds.samples]
+
+    plot_misaligned_concept_images(
+        results=te_results,
+        group_ids=group_ids_list,
+        group_top_sets=group_top_sets,
+        group_prevalence=group_prevalence,
+        concept_match_scores=concept_match_scores,
+        vocab_names=vocab_names,
+        sae_dir=sae_dir,
+        clip_ft=clip_ft,
+        device=device,
+        top_n_concepts=top_n_concepts,
+    )
+    plot_misaligned_vs_fttrain_concept_images(
+        te_results=te_results,
+        ft_results=ft_results,
+        group_ids_te=group_ids_list,
+        group_top_sets=group_top_sets,
+        group_prevalence=group_prevalence,
+        concept_match_scores=concept_match_scores,
+        vocab_names=vocab_names,
+        sae_dir=sae_dir,
+        clip_ft=clip_ft,
+        device=device,
+        top_n_concepts=top_n_concepts,
+    )
+
     report_text = "\n".join(report_lines) + "\n"
-    report_path = os.path.join(sae_dir, "misclassified_concepts_report.txt")
+    report_path = os.path.join(sae_dir, "spurious_concepts_report.txt")
     with open(report_path, "w") as f:
         f.write(report_text)
-    print(f"\nMisclassified concept report saved to {report_path}")
+    print(f"\nSpurious concept report saved to {report_path}")
+    
+    return all_candidate_concepts, top_concepts, concept_source_group, concept_mis_prevalence
+
+
+def make_projection_ablation_hook(dirs):
+    def hook(module, input, output):
+        feat = output.float()
+        for d in dirs:
+            feat = feat - (feat @ d).unsqueeze(-1) * d.unsqueeze(0)
+        return feat.to(output.dtype)
+    return hook
+
+
+def make_sae_ablation_hook(sae_model, concept_idx, device):
+    """
+    Returns a forward hook that routes CLIP's visual output through the SAE,
+    zeros out the specified latent dimensions, then decodes back to CLIP space.
+
+    Usage — build the hook once and pass it as ablation_hook:
+        hook = make_sae_ablation_hook(sae_model, candidate_concepts, device)
+        ablate_spurious_concepts(..., ablation_hook=hook)
+    """
+    concept_idx = list(concept_idx)
+
+    def hook(module, input, output):
+        feat = output.float()                           # (B, D) CLIP features
+        latents, _ = sae_model.encode(feat)             # (B, L) sparse latents
+        latents = latents.clone()
+        latents[:, concept_idx] = 0.0                   # zero spurious concepts
+        reconstructed = sae_model.decode(latents)       # (B, D) back to CLIP space
+        return reconstructed.to(output.dtype)
+
+    return hook
+
+
+def _hook_label(fn) -> str:
+    """Return a human-readable name for an ablation hook callable.
+
+    Handles both plain functions (make_projection_ablation_hook) and
+    closures returned by a factory (make_sae_ablation_hook.<locals>.hook).
+    """
+    qn = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", "unknown")
+    # "make_sae_ablation_hook.<locals>.hook" → "make_sae_ablation_hook"
+    return qn.split(".<locals>")[0]
+
+
+@torch.no_grad()
+def ablate_spurious_concepts(
+    clip_ft, sae_model, test_ds,
+    spurious_concept_indices,
+    device, sae_dir,
+    ablation_hook=make_projection_ablation_hook,
+    vocab_names=None,
+    concept_match_scores=None,
+    concept_source_group=None,
+    concept_mis_prevalence=None,
+    concept_extractor_name=None,
+):
+    """
+    Zero out `spurious_concept_indices` SAE latents for every test image,
+    reconstruct CLIP features from the ablated latents, re-classify, and
+    compare per-group accuracy against the original fine-tuned CLIP predictions.
+
+    Saves: sae_dir/ablation_report_{extractor}_{hook}.txt
+            sae_dir/ablation_corrected_group{1,2}.png
+    """
+    import clip as openai_clip
+    import matplotlib.pyplot as plt
+    from PIL import Image as _PIL
+
+    CLASS_PROMPTS = ["a photo of a landbird", "a photo of a waterbird"]
+    CLASS_NAMES   = ["landbird", "waterbird"]
+    tokens = openai_clip.tokenize(CLASS_PROMPTS).to(device)
+    txt    = clip_ft.model.encode_text(tokens).float()
+    txt    = txt / txt.norm(dim=-1, keepdim=True)
+
+    group_ids   = np.array([s[3] for s in test_ds.samples])
+    true_labels = np.array([s[1] for s in test_ds.samples])
+
+    # ── Spurious concept directions in CLIP feature space ───────────────────
+    concept_idx = list(spurious_concept_indices)
+    if sae_model.model.tied:
+        dirs = sae_model.model.encoder[:, concept_idx].T.float()
+    else:
+        dirs = sae_model.model.decoder[concept_idx].float()
+    dirs = dirs.to(device) / sae_model.scaling_factor.float()
+    dirs = dirs / dirs.norm(dim=-1, keepdim=True)
+
+    # ── Original predictions (no hook) ── store full logits for delta scoring
+    orig_logits = []
+    for path, _, _, _ in tqdm(test_ds.samples, desc="  Original CLIP"):
+        img  = _PIL.open(path).convert("RGB")
+        inp  = clip_ft.preprocess(img).unsqueeze(0).to(device)
+        feat = clip_ft.model.encode_image(inp).float()
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+        orig_logits.append((feat @ txt.T).squeeze(0).cpu())
+    orig_logits = torch.stack(orig_logits)          # (N, 2)
+    orig_preds  = orig_logits.argmax(dim=1).numpy()
+
+    # ── Ablated predictions ───────────────────────────────────────────────────
+    ablated_logits = []
+    sig    = inspect.signature(ablation_hook)
+    hook   = ablation_hook(dirs) if len(sig.parameters) == 1 else ablation_hook
+    handle = clip_ft.model.visual.register_forward_hook(hook)
+    try:
+        for path, _, _, _ in tqdm(test_ds.samples, desc="  Ablated CLIP"):
+            img  = _PIL.open(path).convert("RGB")
+            inp  = clip_ft.preprocess(img).unsqueeze(0).to(device)
+            feat = clip_ft.model.encode_image(inp).float()
+            feat = feat / feat.norm(dim=-1, keepdim=True)
+            ablated_logits.append((feat @ txt.T).squeeze(0).cpu())
+    finally:
+        handle.remove()
+    ablated_logits = torch.stack(ablated_logits)    # (N, 2)
+    ablated_preds  = ablated_logits.argmax(dim=1).numpy()
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    concept_names = []
+    if vocab_names is not None and concept_match_scores is not None:
+        for cid in concept_idx:
+            concept_names.append(f"{cid}:{vocab_names[concept_match_scores[:, cid].argmax()]}")
+    else:
+        concept_names = [str(c) for c in concept_idx]
+
+    # ── Per-group concept breakdown ───────────────────────────────────────────
+    group_concept_counts = {}
+    if concept_source_group is not None:
+        for cid in concept_idx:
+            gid = concept_source_group.get(cid)
+            if gid is not None:
+                group_concept_counts[gid] = group_concept_counts.get(gid, 0) + 1
+
+    report_lines = [
+        "Spurious concept ablation",
+        "=" * 80,
+        f"Ablated concepts ({len(concept_idx)}): {', '.join(concept_names)}",
+    ]
+
+    if group_concept_counts:
+        for gid, cnt in sorted(group_concept_counts.items()):
+            report_lines.append(
+                f"  Group {gid} ({GROUP_NAMES.get(gid, str(gid))}): {cnt} concept(s)"
+            )
+
+    # ── Per-concept prevalence table ─────────────────────────────────────────
+    if concept_mis_prevalence is not None:
+        report_lines += [
+            "-" * 80,
+            f"Concept prevalence in source misaligned group:",
+            f"  {'Concept':<36}  {'Source Group':<10}  {'Prevalence':>10}",
+            "  " + "-" * 62,
+        ]
+        for cid in concept_idx:
+            cname = (
+                vocab_names[concept_match_scores[:, cid].argmax()]
+                if vocab_names is not None and concept_match_scores is not None
+                else str(cid)
+            )
+            src_gid = concept_source_group.get(cid, "?") if concept_source_group else "?"
+            pct     = concept_mis_prevalence.get(cid, float("nan")) * 100
+            report_lines.append(
+                f"  {f'{cid}:{cname}':<36}  {f'Group {src_gid}':<10}  {pct:>9.1f}%"
+            )
+
+    report_lines += [
+        "-" * 80,
+        f"{'Group':<42}  {'Orig Acc':>9}  {'Ablated Acc':>11}  {'Δ Acc':>7}",
+        "-" * 74,
+    ]
+    for gid in sorted(set(group_ids.tolist())):
+        mask        = group_ids == gid
+        orig_acc    = (orig_preds[mask]    == true_labels[mask]).mean()
+        ablated_acc = (ablated_preds[mask] == true_labels[mask]).mean()
+        report_lines.append(
+            f"Group {gid} ({GROUP_NAMES.get(gid, str(gid)):<35})  "
+            f"{orig_acc*100:>8.1f}%  {ablated_acc*100:>10.1f}%  "
+            f"{(ablated_acc - orig_acc)*100:>+6.1f}%"
+        )
+    overall_orig    = (orig_preds    == true_labels).mean()
+    overall_ablated = (ablated_preds == true_labels).mean()
+    report_lines += [
+        "-" * 74,
+        f"{'Overall':<42}  {overall_orig*100:>8.1f}%  {overall_ablated*100:>10.1f}%  "
+        f"{(overall_ablated - overall_orig)*100:>+6.1f}%",
+    ]
+
+    report_text = "\n".join(report_lines) + "\n"
+    extractor_tag = concept_extractor_name or "unknown_extractor"
+    hook_tag      = _hook_label(ablation_hook)
+    report_fname  = f"ablation_report_{extractor_tag}__{hook_tag}.txt"
+    report_path   = os.path.join(sae_dir, report_fname)
+    with open(report_path, "w") as f:
+        f.write(report_text)
+    print(report_text)
+    print(f"Ablation report saved to {report_path}")
+
+    # ── Corrected-images plots for misaligned groups 1 and 2 ─────────────────
+    orig_logits_np    = orig_logits.numpy()
+    ablated_logits_np = ablated_logits.numpy()
+
+    for gid in [1, 2]:
+        g_indices = np.where(group_ids == gid)[0]
+        if len(g_indices) == 0:
+            continue
+
+        # images where prediction flipped from wrong → correct
+        was_wrong   = orig_preds[g_indices]    != true_labels[g_indices]
+        now_correct = ablated_preds[g_indices] == true_labels[g_indices]
+        corrected   = g_indices[was_wrong & now_correct]
+
+        if len(corrected) == 0:
+            print(f"  Group {gid}: no corrected predictions — skipping plot.")
+            continue
+
+        # score = increase in logit for the true class after ablation
+        true_cls_idx = true_labels[corrected]
+        scores = (
+            ablated_logits_np[corrected, true_cls_idx] -
+            orig_logits_np[corrected, true_cls_idx]
+        )
+        top_k    = min(10, len(corrected))
+        top_order = np.argsort(scores)[::-1][:top_k]
+        top_idx   = corrected[top_order]
+        top_scores = scores[top_order]
+
+        fig, axes = plt.subplots(1, top_k, figsize=(2.5 * top_k, 3.5), squeeze=False)
+        fig.suptitle(
+            f"Group {gid} ({GROUP_NAMES.get(gid, str(gid))}) — "
+            f"Top {top_k} corrected after ablation",
+            fontsize=10, fontweight="bold",
+        )
+        for col in range(top_k):
+            idx   = top_idx[col]
+            score = top_scores[col]
+            ax    = axes[0, col]
+            ax.imshow(_PIL.open(test_ds.samples[idx][0]).convert("RGB"))
+            ax.axis("off")
+            true_cls  = CLASS_NAMES[true_labels[idx]]
+            orig_cls  = CLASS_NAMES[orig_preds[idx]]
+            ax.set_title(
+                f"true:{true_cls}\norig:{orig_cls}\nΔ={score:.3f}",
+                fontsize=7,
+            )
+        plt.tight_layout()
+        fpath = os.path.join(sae_dir, f"ablation_corrected_group{gid}.png")
+        plt.savefig(fpath, bbox_inches="tight", dpi=120)
+        plt.close()
+        print(f"  Saved corrected plot (group {gid}): {fpath}")
+
+    # ── Harmed-images plots for aligned groups 0 and 3 ───────────────────────
+    # Images that were correct before ablation but wrong after (collateral damage).
+    # Ranked by biggest drop in the true-class logit.
+    for gid in [0, 3]:
+        g_indices = np.where(group_ids == gid)[0]
+        if len(g_indices) == 0:
+            continue
+
+        was_correct  = orig_preds[g_indices]    == true_labels[g_indices]
+        now_wrong    = ablated_preds[g_indices] != true_labels[g_indices]
+        harmed       = g_indices[was_correct & now_wrong]
+
+        if len(harmed) == 0:
+            print(f"  Group {gid}: no harmed predictions — skipping plot.")
+            continue
+
+        # score = drop in logit for the true class (higher = bigger drop)
+        true_cls_idx = true_labels[harmed]
+        scores = (
+            orig_logits_np[harmed, true_cls_idx] -
+            ablated_logits_np[harmed, true_cls_idx]
+        )
+        top_k     = min(10, len(harmed))
+        top_order = np.argsort(scores)[::-1][:top_k]
+        top_idx   = harmed[top_order]
+        top_scores = scores[top_order]
+
+        fig, axes = plt.subplots(1, top_k, figsize=(2.5 * top_k, 3.5), squeeze=False)
+        fig.suptitle(
+            f"Group {gid} ({GROUP_NAMES.get(gid, str(gid))}) — "
+            f"Top {top_k} harmed after ablation",
+            fontsize=10, fontweight="bold",
+        )
+        for col in range(top_k):
+            idx   = top_idx[col]
+            score = top_scores[col]
+            ax    = axes[0, col]
+            ax.imshow(_PIL.open(test_ds.samples[idx][0]).convert("RGB"))
+            ax.axis("off")
+            true_cls    = CLASS_NAMES[true_labels[idx]]
+            ablated_cls = CLASS_NAMES[ablated_preds[idx]]
+            ax.set_title(
+                f"true:{true_cls}\nabl:{ablated_cls}\nΔ={-score:.3f}",
+                fontsize=7,
+            )
+        plt.tight_layout()
+        fpath = os.path.join(sae_dir, f"ablation_harmed_group{gid}.png")
+        plt.savefig(fpath, bbox_inches="tight", dpi=120)
+        plt.close()
+        print(f"  Saved harmed plot (group {gid}): {fpath}")
 
 
 def save_representations(results, split_name, run_dir):
@@ -940,45 +1624,20 @@ def main():
     )
     clip_ft = CLIPZeroShot.load_model(os.path.join(run_dir, "model.pt"), device=device)
     clip_ft.model.eval()
-    print(f"\nModel loaded  (device={device})")
+    print(f"\nFine-tuned model loaded  (device={device})")
 
-    # # ── Extract ft_train features ─────────────────────────────────────────────
-    # print("\nExtracting ft_train features...")
-    # ft_feat = extract_features(clip_ft, ft_ds, args.batch_size, device)
-    # n_ft, d = ft_feat.shape
-    # ft_feat_path = save_memmap(
-    #     ft_feat,
-    #     os.path.join(run_dir, f"waterbirds_ft_fttrain_{n_ft}_{d}.npy"),
-    # )
+    # ── Load zero-shot (base) CLIP model ──────────────────────────────────────
+    # clip_zs = CLIPZeroShot(model_name=args.clip_model, device=device)
+    # clip_zs.model.eval()
+    # print(f"Zero-shot model loaded   ({args.clip_model})")
 
-    # # ── Extract test features ─────────────────────────────────────────────────
-    # print("\nExtracting test features...")
-    # te_feat = extract_features(clip_ft, test_ds, args.batch_size, device)
-    # n_te, _ = te_feat.shape
-    # te_feat_path = save_memmap(
-    #     te_feat,
-    #     os.path.join(run_dir, f"waterbirds_ft_test_{n_te}_{d}.npy"),
-    # )
 
-    # ── Print SAE training command ────────────────────────────────────────────
-    # msae_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "msae")
-    # rel_ft   = os.path.relpath(ft_feat_path, start=msae_dir)
-    # rel_te   = os.path.relpath(te_feat_path, start=msae_dir)
-
-    # print("\n" + "═" * 65)
-    # print("  Feature extraction complete.")
-    # print("  To train SAE, run from the msae/ directory:\n")
-    # print(f"    python train.py \\")
-    # print(f"        -dt {rel_ft} \\")
-    # print(f"        -ds {rel_te} \\")
-    # print(f"        -m MSAE_UW -a TopKReLU_64 -e 100")
-    # print("═" * 65 + "\n")
+    
 
     # ── SAE representation extraction (optional) ──────────────────────────────
     from sae import SAE  # type: ignore[import]
 
-    # msae_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "msae")
-
+    
     # resolve ft feature file and embed dim from previously saved .npy in run_dir
     embedding_path = os.path.join(os.path.dirname(run_dir), "embeddings")
     model_tag = args.clip_model.replace("/", "~")
@@ -989,7 +1648,6 @@ def main():
     ########### UPDATE TO CHOOSE CORRECT FILE BASED ON FINETUNING TAG (BIASED vs FULL) AND MAX_SAMPLES
     ft_feat_path = max(ft_npy_files, key=os.path.getmtime)
     d = int(os.path.basename(ft_feat_path).replace(".npy", "").split("_")[-1])
-    # dataset_stem = os.path.basename(ft_feat_path).replace(".npy", "")
     print(f"\nFT feature file : {ft_feat_path}  (embed_dim={d})")
 
     # ── Build activation string exactly as train.py does ────────────────────────
@@ -997,12 +1655,10 @@ def main():
     if args.model == "ReLUSAE" and "_" in _act:
         _act_base, _sparse_w = _act.split("_", 1)
         activation_str = f"{_act_base}_{str(float(f'0.{_sparse_w}')).split('.')[1]}"
-        # sae_tag = f"{args.model}_{activation_str}"
     elif args.model in ["MSAE_UW", "MSAE_RW"]:
         model = args.model.replace("MSAE_", "")
         activation_str = "TopK_64" + "_" + model
-        # sae_tag = f"{model_tag}_{activation_str}"
-
+    
     else:
         activation_str = _act
     
@@ -1056,87 +1712,106 @@ def main():
     
 
     print("\nExtracting SAE representations — ft_train...")
-    ft_results = extract_sae_representations(clip_ft, sae_model, ft_ds, device)
-    ### ft_resutls include: 
-        #     "clip_representations": torch.stack(clip_reps),
-        # "sae_representations":  torch.stack(sae_reps),
-        # "sae_reconstructed":    torch.stack(sae_recons),
-        # "image_paths":          image_paths,
-        # "metrics":              metrics_all,
+    ft_results_path = os.path.join(sae_dir, "representations_ft_train")
+    if os.path.exists(ft_results_path):
+        print(f"  Found existing representations at {ft_results_path} — loading.")
+        _m = pd.read_csv(os.path.join(ft_results_path, "metrics.csv"), index_col="img_path")
+        ft_results = {
+            "clip_representations": torch.load(os.path.join(ft_results_path, "clip_representations.pt"),
+                                               map_location="cpu", weights_only=False),
+            "sae_representations":  torch.load(os.path.join(ft_results_path, "sae_representations.pt"),
+                                               map_location="cpu", weights_only=False),
+            "sae_reconstructed":    torch.load(os.path.join(ft_results_path, "sae_reconstructed.pt"),
+                                               map_location="cpu", weights_only=False),
+            "metrics":     _m.to_dict(orient="list"),
+            "image_paths": _m.index.tolist(),
+        }
+    else:
+        ft_results = extract_sae_representations(clip_ft, sae_model, ft_ds, device)
+        save_representations(ft_results, "ft_train", sae_dir)
 
-    save_representations(ft_results, "ft_train", sae_dir)
-
+    
     print("\nExtracting SAE representations — test...")
-    te_results = extract_sae_representations(clip_ft, sae_model, test_ds, device)
-     ### te_resutls include:
-        #     "clip_representations": torch.stack(clip_reps),
-        # "sae_representations":  torch.stack(sae_reps),
-        # "sae_reconstructed":    torch.stack(sae_recons),
-        # "image_paths":          image_paths,
-        # "metrics":              metrics_all,
-    save_representations(te_results, "test", sae_dir)
+    te_results_path = os.path.join(sae_dir, "representations_test")
+    if os.path.exists(te_results_path):
+        print(f"  Found existing representations at {te_results_path} — loading.")
+        _m = pd.read_csv(os.path.join(te_results_path, "metrics.csv"), index_col="img_path")
+        te_results = {
+            "clip_representations": torch.load(os.path.join(te_results_path, "clip_representations.pt"),
+                                               map_location="cpu", weights_only=False),
+            "sae_representations":  torch.load(os.path.join(te_results_path, "sae_representations.pt"),
+                                               map_location="cpu", weights_only=False),
+            "sae_reconstructed":    torch.load(os.path.join(te_results_path, "sae_reconstructed.pt"),
+                                               map_location="cpu", weights_only=False),
+            "metrics":     _m.to_dict(orient="list"),
+            "image_paths": _m.index.tolist(),
+        }
+    else:
+    
+        te_results = extract_sae_representations(clip_ft, sae_model, test_ds, device)
+        save_representations(te_results, "test", sae_dir)
 
     #### plot outputs
-    import matplotlib.pyplot as plt
-    # plot histogram of activations
-    plt.figure(figsize=(10, 3))
-    plt.title("Flattened Activation Frequency-SAE Representations--ft_train")
-    plt.yscale('log')
-    plt.hist(ft_results["sae_representations"].flatten().cpu().numpy(), bins=30)
-    plt.xlim(0.0, 2)
-    # plt.show()
-    plt.savefig(os.path.join(sae_dir, "activation_histogram_ft_train.png"))
+    # import matplotlib.pyplot as plt
+    # # plot histogram of activations
+    # plt.figure(figsize=(10, 3))
+    # plt.title("Flattened Activation Frequency-SAE Representations--ft_train")
+    # plt.yscale('log')
+    # plt.hist(ft_results["sae_representations"].flatten().cpu().numpy(), bins=30)
+    # plt.xlim(0.0, 2)
+    # # plt.show()
+    # plt.savefig(os.path.join(sae_dir, "activation_histogram_ft_train.png"))
 
 
+    # not needed
+    # mean_activations = ft_results["sae_representations"].mean(dim=0)
+    # std_activations = ft_results["sae_representations"].std(dim=0)
 
-    mean_activations = ft_results["sae_representations"].mean(dim=0)
-    std_activations = ft_results["sae_representations"].std(dim=0)
-
-    plt.figure(figsize=(10, 3))
-    plt.title("Mean Activation Frequency _ft")
-    plt.yscale('log')
-    plt.hist(mean_activations.cpu().numpy(), bins=30)
-    plt.xlim(0.0, 2)
-    # plt.show()
-    plt.savefig(os.path.join(sae_dir, "mean_activation_histogram_ft_train.png"))
+    # plt.figure(figsize=(10, 3))
+    # plt.title("Mean Activation Frequency _ft")
+    # plt.yscale('log')
+    # plt.hist(mean_activations.cpu().numpy(), bins=30)
+    # plt.xlim(0.0, 2)
+    # # plt.show()
+    # plt.savefig(os.path.join(sae_dir, "mean_activation_histogram_ft_train.png"))
     
     
-    plt.figure(figsize=(10, 3))
-    plt.title("Flattened Centered Activation Frequency_ft_train")
-    plt.yscale('log')
-    plt.hist(torch.nn.functional.relu(ft_results["sae_representations"]-mean_activations).flatten().cpu().numpy(), bins=30)
-    plt.xlim(0.0, 2)
-    # plt.show()
-    plt.savefig(os.path.join(sae_dir, "centered_activation_histogram_ft_train.png"))
+    # plt.figure(figsize=(10, 3))
+    # plt.title("Flattened Centered Activation Frequency_ft_train")
+    # plt.yscale('log')
+    # plt.hist(torch.nn.functional.relu(ft_results["sae_representations"]-mean_activations).flatten().cpu().numpy(), bins=30)
+    # plt.xlim(0.0, 2)
+    # # plt.show()
+    # plt.savefig(os.path.join(sae_dir, "centered_activation_histogram_ft_train.png"))
 
-    ########## test set results
-    plt.figure(figsize=(10, 3))
-    plt.title("Flattened Activation Frequency-SAE Representations--ft_test")
-    plt.yscale('log')
-    plt.hist(te_results["sae_representations"].flatten().cpu().numpy(), bins=30)
-    plt.xlim(0.0, 2)
-    # plt.show()
-    plt.savefig(os.path.join(sae_dir, "activation_histogram_ft_test.png"))
+    # ########## test set results
+    # plt.figure(figsize=(10, 3))
+    # plt.title("Flattened Activation Frequency-SAE Representations--ft_test")
+    # plt.yscale('log')
+    # plt.hist(te_results["sae_representations"].flatten().cpu().numpy(), bins=30)
+    # plt.xlim(0.0, 2)
+    # # plt.show()
+    # plt.savefig(os.path.join(sae_dir, "activation_histogram_ft_test.png"))
 
-    mean_activations = te_results["sae_representations"].mean(dim=0)
-    std_activations = te_results["sae_representations"].std(dim=0)
+    # mean_activations = te_results["sae_representations"].mean(dim=0)
+    # std_activations = te_results["sae_representations"].std(dim=0)
 
-    plt.figure(figsize=(10, 3))
-    plt.title("Mean Activation Frequency _test")
-    plt.yscale('log')
-    plt.hist(mean_activations.cpu().numpy(), bins=30)
-    plt.xlim(0.0, 2)
-    # plt.show()
-    plt.savefig(os.path.join(sae_dir, "mean_activation_histogram_ft_test.png"))
+    # plt.figure(figsize=(10, 3))
+    # plt.title("Mean Activation Frequency _test")
+    # plt.yscale('log')
+    # plt.hist(mean_activations.cpu().numpy(), bins=30)
+    # plt.xlim(0.0, 2)
+    # # plt.show()
+    # plt.savefig(os.path.join(sae_dir, "mean_activation_histogram_ft_test.png"))
     
     
-    plt.figure(figsize=(10, 3))
-    plt.title("Flattened Centered Activation Frequency_ft_test")
-    plt.yscale('log')
-    plt.hist(torch.nn.functional.relu(te_results["sae_representations"]-mean_activations).flatten().cpu().numpy(), bins=30)
-    plt.xlim(0.0, 2)
-    # plt.show()
-    plt.savefig(os.path.join(sae_dir, "centered_activation_histogram_ft_test.png"))
+    # plt.figure(figsize=(10, 3))
+    # plt.title("Flattened Centered Activation Frequency_ft_test")
+    # plt.yscale('log')
+    # plt.hist(torch.nn.functional.relu(te_results["sae_representations"]-mean_activations).flatten().cpu().numpy(), bins=30)
+    # plt.xlim(0.0, 2)
+    # # plt.show()
+    # plt.savefig(os.path.join(sae_dir, "centered_activation_histogram_ft_test.png"))
 
     ##### extract the names of concepts from vocab and show these names beside the top 10 concepts for the image with the highest activation in the test set
     
@@ -1163,40 +1838,41 @@ def main():
     
     
     ################# Concept detection
-    top1 = find_top_concept_images(
-        te_results, top_k=1,
-        mean_activations=mean_activations,
-        concept_match_scores=concept_match_scores,
-        vocab_names=vocab_names,
-        save_path=os.path.join(sae_dir, "concept_detection_example.png"),
-    )[0]
-    image_index  = top1["image_index"]
-    argmax_index = top1["concept_index"]
-    print(f'argmax index: {argmax_index}, value: {top1["activation"]}')
-    ##### concept translation
+    # top1 = find_top_concept_images(
+    #     te_results, top_k=1,
+    #     mean_activations=mean_activations,
+    #     concept_match_scores=concept_match_scores,
+    #     vocab_names=vocab_names,
+    #     save_path=os.path.join(sae_dir, "concept_detection_example.png"),
+    # )[0]
+    # image_index  = top1["image_index"]
+    # argmax_index = top1["concept_index"]
+    # print(f'argmax index: {argmax_index}, value: {top1["activation"]}')
+    # ##### concept translation
     
-    top5_names = torch.from_numpy(concept_match_scores)[:,image_index].topk(5)
-    for i in range(5):
-        print(f'Top 5 concept for image {image_index}: {vocab_names[top5_names.indices[i]]} with score {top5_names.values[i].item():.2f}')
-    ##### get the highest magnitude concept for the image from top 10 and find images that activate it the most
-    from PIL import Image
-    highest_concept_index = argmax_index
-    print(f'Highest magnitude concept index: {highest_concept_index}')
-    concept_activations = te_results["sae_representations"][:,highest_concept_index] - mean_activations[highest_concept_index]
-    top_images = torch.topk(concept_activations, 5)
-    fig, ax = plt.subplots(1, 5, figsize=(15, 3))
-    for i, idx in enumerate(top_images.indices.cpu().numpy()):
-        ax[i].imshow(Image.open(te_results["image_paths"][idx]).convert('RGB'))
-        ax[i].axis('off')
-        ax[i].set_title(f'Image {idx}\nActivation: {concept_activations[idx].item():.2f}')
-    plt.tight_layout()
-    plt.savefig(os.path.join(sae_dir, "top_concept_images.png"))
+    # top5_names = torch.from_numpy(concept_match_scores)[:,image_index].topk(5)
+    # for i in range(5):
+    #     print(f'Top 5 concept for image {image_index}: {vocab_names[top5_names.indices[i]]} with score {top5_names.values[i].item():.2f}')
+    # ##### get the highest magnitude concept for the image from top 10 and find images that activate it the most
+    # from PIL import Image
+    # highest_concept_index = argmax_index
+    # print(f'Highest magnitude concept index: {highest_concept_index}')
+    # concept_activations = te_results["sae_representations"][:,highest_concept_index] - mean_activations[highest_concept_index]
+    # top_images = torch.topk(concept_activations, 5)
+    # fig, ax = plt.subplots(1, 5, figsize=(15, 3))
+    # for i, idx in enumerate(top_images.indices.cpu().numpy()):
+    #     ax[i].imshow(Image.open(te_results["image_paths"][idx]).convert('RGB'))
+    #     ax[i].axis('off')
+    #     ax[i].set_title(f'Image {idx}\nActivation: {concept_activations[idx].item():.2f}')
+    # plt.tight_layout()
+    # plt.savefig(os.path.join(sae_dir, "top_concept_images.png"))
     # plt.show()
 
     
 
     ##### Group concept distribution + shared-concept report + misaligned image grids
-    group_ids = [s[3] for s in test_ds.samples]
+    ##### Experiments set 2 
+    # group_ids = [s[3] for s in test_ds.samples]
     # analyze_group_concepts(
     #     results=te_results,
     #     group_ids=group_ids,
@@ -1209,17 +1885,47 @@ def main():
     #     ft_results=ft_results,
     # )
 
-    ##### Misclassified-image concept analysis
-    analyze_misclassified_concepts(
+    ##### Misclassified-image concept analysis 
+    ####### experiment set 3: for each misaligned group, find concepts that are highly prevalent among the misclassified images, then show the top activating test images for those concepts alongside the top activating fine-tune set images for the same concepts
+    # candidate_concepts, concept_source_group, concept_mis_prevalence = analyze_misclassified_concepts(
+    #     te_results=te_results,
+    #     ft_results=ft_results,
+    #     test_ds=test_ds,
+    #     ft_ds=ft_ds,
+    #     concept_match_scores=concept_match_scores,
+    #     vocab_names=vocab_names,
+    #     sae_dir=sae_dir,
+    #     clip_ft=clip_ft,
+    # )
+
+
+    ### Experiment set 4: find concepts that are highly prevalent among the misclassified images and have low prevalence among the fine-tune set images, as potential spurious correlates learned by the model
+    candidate_concepts, top_concepts, concept_source_group, concept_mis_prevalence = find_spurious_concepts(
         te_results=te_results,
         ft_results=ft_results,
         test_ds=test_ds,
+        ft_ds=ft_ds,
         concept_match_scores=concept_match_scores,
         vocab_names=vocab_names,
         sae_dir=sae_dir,
         clip_ft=clip_ft,
     )
 
+    if len(candidate_concepts) > 0:
+        ablate_spurious_concepts(
+            clip_ft=clip_ft,
+            sae_model=sae_model,
+            test_ds=test_ds,
+            spurious_concept_indices=candidate_concepts,
+            device=device,
+            sae_dir=sae_dir,
+            vocab_names=vocab_names,
+            concept_match_scores=concept_match_scores,
+            ablation_hook=make_sae_ablation_hook(sae_model, candidate_concepts, device), # make_projection_ablation_hook,     ###make_sae_ablation_hook(sae_model, candidate_concepts, device),
+            concept_source_group=concept_source_group,
+            concept_mis_prevalence=concept_mis_prevalence,
+            concept_extractor_name="find_spurious_concepts",
+        )
 
 if __name__ == "__main__":
     main()
