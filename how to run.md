@@ -1,6 +1,6 @@
 1- fine-tune clip to make sure spurrious correlation exists
 it generates and saves, clip model and manifest files
-
+run_waterbirds_msae.py
 2- start with precompute_activations, and run it for the waterbirds dataset on the clip model. to adjust to our fine_tuned implementation we need to have some updates on the code to get fine_tuned model's embeddings(update implemented for ft_model loading -June 09), and also the predefined dataset used for fine tunning. in the current setting everywhere the zero shot clip is being used and also full training set of the waterbirds dataset. 
 the code has not been tested and/or executed on other datasets, where some inconsistency in loading data exists for example for the imagenet.
 
