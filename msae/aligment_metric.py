@@ -6,7 +6,7 @@ from tqdm import tqdm
 from scipy.optimize import linear_sum_assignment
 
 from sae import load_model
-from utils import set_seed
+from .utils import set_seed
 
 """
 SAE Alignment Analysis Tool from paper:

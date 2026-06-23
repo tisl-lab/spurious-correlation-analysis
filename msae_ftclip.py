@@ -30,6 +30,18 @@ import glob
 import os
 import sys
 import inspect  ## for context_decorator for ablation hooks
+from einops import rearrange
+from torchvision import transforms
+
+from msae import sae
+from clip_lrp import CLIPLRPWrapper
+import numpy as np
+import cv2
+import torch
+from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
+from clip_lrp import CLIPLRPWrapper
+
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _PROJECT_ROOT)
@@ -104,7 +116,7 @@ def parse_args():
     parser.add_argument("-m", "--model",      type=str, default="MSAE_RW",
                         choices=["ReLUSAE", "TopKSAE", "BatchTopKSAE", "MSAE_UW", "MSAE_RW"],
                         help="SAE model architecture (matches msae/train.py --model)")
-    parser.add_argument("-a", "--activation", type=str, default="",
+    parser.add_argument("-a", "--activation", type=str, default="TopKReLU_256",
                         help="SAE activation string (matches msae/train.py --activation, "
                              "e.g. 'ReLU_03', 'TopKReLU_64')")
     return parser.parse_args()
@@ -222,19 +234,25 @@ def extract_sae_representations(clip_model, sae_model, dataset, device):
         inp   = clip_model.preprocess(img).unsqueeze(0).to(device)
 
         features = clip_model.model.encode_image(inp).float()           # (1, D)
-        # post_reconstructed, reconstructed, full_latents
-        post_reconstructed, _, full_latents = sae_model(features)    # Autoencoder forward
-        
+
+        # SAE.encode() → (sparse_latents, dense_latents)
+        # sparse_latents: TopK-selected (exactly k non-zero for TopK/MSAE models)
+        # dense_latents:  ReLU on ALL features without top-k gate — discarded here.
+        # Must use sparse_latents: for TopK/MSAE, SAE.forward() returns dense_latents
+        # causing L0≈0 because forward_eval bypasses the top-k gate entirely.
+        sparse_latents, _ = sae_model.encode(features)
+        post_reconstructed = sae_model.decode(sparse_latents)
+
         clip_reps.append(features.cpu().flatten())
-        sae_reps.append(full_latents.cpu().flatten())
+        sae_reps.append(sparse_latents.cpu().flatten())
         sae_recons.append(post_reconstructed.cpu().flatten())
         image_paths.append(path)
 
         fvu = msae_metrics.explained_variance(features, post_reconstructed)
         mae = msae_metrics.normalized_mean_absolute_error(features, post_reconstructed)
         cs  = F.cosine_similarity(features, post_reconstructed)
-        l0  = msae_metrics.l0_messure(full_latents)
-        highest_magnitude = full_latents.max(dim=-1).values
+        l0  = msae_metrics.l0_messure(sparse_latents)
+        highest_magnitude = sparse_latents.max(dim=-1).values
 
         metrics_all.append({
             "fvu":               fvu.item() if hasattr(fvu, "item") else float(fvu),
@@ -688,6 +706,7 @@ def plot_concept_top_images(
     ft_row_title="FT set",
     te_labels=None,
     ft_labels=None,
+    sae_dir=None,
 ):
     """
     Saves two separate plots — one per split — into their respective folders:
@@ -701,7 +720,9 @@ def plot_concept_top_images(
     """
     import matplotlib.pyplot as plt
     from PIL import Image as _PIL
-
+    from einops import rearrange
+    from torchvision import transforms
+    from overcomplete.visualization import show
     plot_paths = []
     for indices, paths_list, reps, row_title, save_dir, img_labels in [
         (top10_te_indices, te_paths, te_reps_np, te_row_title, test_save_dir, te_labels),
@@ -721,6 +742,7 @@ def plot_concept_top_images(
             if col < len(indices):
                 idx = indices[col]
                 act = reps[idx, cid]
+
                 ax.imshow(_PIL.open(paths_list[idx]).convert("RGB"))
                 lbl = img_labels[col] if img_labels is not None and col < len(img_labels) else ""
                 title = f"{lbl}\n{act:.3f}" if lbl else f"{act:.3f}"
@@ -739,8 +761,8 @@ def analyze_misclassified_concepts(
     concept_match_scores, vocab_names,
     sae_dir, clip_ft,
     activation_threshold=None,
-    prevalence_threshold=0.90,
-    top_n_concepts=20,
+    prevalence_threshold=0.30,
+    top_n_concepts=50,
 ):
     """
     Standalone experiment: for each misaligned group (1 = landbird/water,
@@ -959,13 +981,201 @@ def analyze_misclassified_concepts(
     return all_concepts, concept_source_group, concept_mis_prevalence
 
 
+_HF_MODEL_NAMES = {
+    "ViT-B/32": "openai/clip-vit-base-patch32",
+    "ViT-B~32": "openai/clip-vit-base-patch32",
+    "ViT-B/16": "openai/clip-vit-base-patch16",
+    "ViT-B~16": "openai/clip-vit-base-patch16",
+    "ViT-L/14": "openai/clip-vit-large-patch14",
+}
+_lrp_wrapper_cache: dict = {}
+
+def show_cam_on_image(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)  # applyColorMap outputs BGR; img is RGB
+    heatmap = np.float32(heatmap) / 255
+    cam = heatmap + np.float32(img)
+    cam = cam / np.max(cam)
+    return cam
+
+def generate_clip_saliency(
+    images: list,
+    prompts: list,
+    clip_ft,
+) -> list[dict]:
+    """
+    Occlusion-based patch saliency for each (image, prompt) pair.
+
+    For each patch, the patch pixels are zeroed and the drop in cosine similarity
+    is recorded as its importance score.  Uses the cached HuggingFace model from
+    _lrp_wrapper_cache so the HF model is only loaded once across both methods.
+
+    Returns a list of dicts with the same keys as generate_clip_heatmaps:
+        "heatmap_bgr"  : np.ndarray uint8 BGR overlay
+        "heatmap_rgb"  : np.ndarray uint8 RGB overlay
+        "attribution"  : np.ndarray float32 [grid_size, grid_size]
+        "similarity"   : float baseline cosine similarity
+    """
+    device = next(clip_ft.model.parameters()).device
+    model_name = clip_ft.model_name
+
+    if model_name not in _lrp_wrapper_cache:
+        hf_name = _HF_MODEL_NAMES.get(model_name, "openai/clip-vit-base-patch32")
+        hf_model = CLIPModel.from_pretrained(hf_name, attn_implementation="eager").to(device)
+        hf_processor = CLIPProcessor.from_pretrained(hf_name)
+        _lrp_wrapper_cache[model_name] = CLIPLRPWrapper(hf_model, hf_processor)
+
+    wrapper = _lrp_wrapper_cache[model_name]
+    clip_model = wrapper.model
+    clip_processor = wrapper.processor
+    gs = wrapper.grid_size        # e.g. 7 for ViT-B/32, 14 for ViT-B/16
+    ps = wrapper.patch_size       # e.g. 32 or 16
+    img_size = wrapper.image_size # 224
+
+    results = []
+    for image, prompt in zip(images, prompts):
+        clip_image = image.convert("RGB")
+
+        image_inputs = clip_processor(images=clip_image, return_tensors="pt")
+        text_inputs  = clip_processor(text=[prompt], return_tensors="pt", padding=True)
+
+        pixel_values = image_inputs["pixel_values"].to(device)
+        text_ids     = text_inputs["input_ids"].to(device)
+        text_mask    = text_inputs["attention_mask"].to(device)
+
+        with torch.no_grad():
+            vision_out   = clip_model.vision_model(pixel_values=pixel_values, return_dict=True)
+            img_emb      = clip_model.visual_projection(vision_out.pooler_output)
+            img_emb      = img_emb / img_emb.norm(dim=-1, keepdim=True)
+
+            text_out     = clip_model.text_model(input_ids=text_ids, attention_mask=text_mask, return_dict=True)
+            txt_emb      = clip_model.text_projection(text_out.pooler_output)
+            txt_emb      = txt_emb / txt_emb.norm(dim=-1, keepdim=True)
+
+            baseline_sim = (img_emb * txt_emb).sum(dim=-1).item()
+
+        patch_saliency_list = []
+        n_patches = gs * gs
+        for patch_idx in range(n_patches):
+            pv_masked = pixel_values.clone().detach()
+            r = patch_idx // gs
+            c = patch_idx % gs
+            pv_masked[:, :, r * ps:(r + 1) * ps, c * ps:(c + 1) * ps] = 0
+
+            with torch.no_grad():
+                vo_m    = clip_model.vision_model(pixel_values=pv_masked, return_dict=True)
+                ie_m    = clip_model.visual_projection(vo_m.pooler_output)
+                ie_m    = ie_m / ie_m.norm(dim=-1, keepdim=True)
+                masked_sim = (ie_m * txt_emb).sum(dim=-1).item()
+
+            patch_saliency_list.append(max(0.0, baseline_sim - masked_sim))
+
+        patch_saliency = np.array(patch_saliency_list).reshape(gs, gs)
+        if patch_saliency.max() > 0:
+            patch_saliency = patch_saliency / patch_saliency.max()
+
+        sal_t = torch.from_numpy(patch_saliency[np.newaxis, np.newaxis].astype(np.float32))
+        sal_up = torch.nn.functional.interpolate(
+            sal_t, size=(img_size, img_size), mode="bilinear", align_corners=False,
+        ).squeeze().numpy()
+
+        image_array = np.array(clip_image.resize((img_size, img_size))) / 255.0
+        vis = show_cam_on_image(image_array, sal_up)
+        vis = np.uint8(255 * vis)
+        vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+
+        results.append({
+            "heatmap_bgr": vis_bgr,
+            "heatmap_rgb": cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB),
+            "attribution": patch_saliency,
+            "similarity":  baseline_sim,
+        })
+
+    return results
+
+
+def generate_clip_heatmaps(
+    images: list[Image.Image],
+    prompts: list[str],
+    clip_ft,
+    method: str = "transformer_attribution",
+) -> list[dict]:
+    """
+    Generate LRP heatmaps for each (image, prompt) pair using the fine-tuned CLIP model.
+
+    Parameters
+    ----------
+    images   : list of PIL Images
+    prompts  : list of text strings, one per image
+    clip_ft  : CLIPZeroShot — device and model name are derived from it
+    method   : "transformer_attribution" (recommended) | "attention_rollout" | "gradient"
+
+    Returns
+    -------
+    List of dicts with keys:
+        "heatmap_bgr"  : np.ndarray uint8 BGR overlay (for cv2.imwrite / imshow)
+        "heatmap_rgb"  : np.ndarray uint8 RGB overlay (for plt.imshow)
+        "attribution"  : np.ndarray float32 [grid_size, grid_size] raw scores
+        "similarity"   : float cosine similarity score
+    """
+    device = next(clip_ft.model.parameters()).device
+    model_name = clip_ft.model_name
+
+    # Load or reuse the HuggingFace CLIP model required by CLIPLRPWrapper.
+    # LRP attribution needs HuggingFace's eager attention implementation.
+    if model_name not in _lrp_wrapper_cache:
+        hf_name = _HF_MODEL_NAMES.get(model_name, "openai/clip-vit-base-patch32")
+        hf_model = CLIPModel.from_pretrained(hf_name, attn_implementation="eager").to(device)
+        hf_processor = CLIPProcessor.from_pretrained(hf_name)
+        _lrp_wrapper_cache[model_name] = CLIPLRPWrapper(hf_model, hf_processor)
+
+    wrapper = _lrp_wrapper_cache[model_name]
+    results = []
+
+    for image, prompt in zip(images, prompts):
+        image_rgb = image.convert("RGB")
+        img_size = wrapper.image_size
+
+        # Preprocess
+        image_inputs = wrapper.processor(images=image_rgb, return_tensors="pt")
+        text_inputs  = wrapper.processor(text=[prompt], return_tensors="pt", padding=True)
+
+        pixel_values       = image_inputs["pixel_values"].to(device)
+        text_input_ids     = text_inputs["input_ids"].to(device)
+        text_attention_mask = text_inputs["attention_mask"].to(device)
+
+        # Overlay base image
+        image_np = np.array(image_rgb.resize((img_size, img_size))) / 255.0
+
+        # Run attribution + visualization
+        heatmap_bgr, similarity = wrapper.generate_lrp_visualization(
+            pixel_values=pixel_values,
+            text_input_ids=text_input_ids,
+            text_attention_mask=text_attention_mask,
+            original_image_np=image_np,
+            method=method,
+        )
+
+        # Raw attribution map (no overlay) for downstream use
+        attribution, _ = wrapper.generate_lrp_image_text_attribution(
+            pixel_values, text_input_ids, text_attention_mask, method=method
+        )
+
+        results.append({
+            "heatmap_bgr": heatmap_bgr,
+            "heatmap_rgb": cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB),
+            "attribution": attribution.cpu().numpy(),
+            "similarity": similarity,
+        })
+
+    return results
 
 def find_spurious_concepts(
     te_results, ft_results, test_ds, ft_ds,
     concept_match_scores, vocab_names,
     sae_dir, clip_ft,
     activation_threshold=None,
-    prevalence_threshold=0.90,
+    prevalence_threshold=0.30,
     top_n_concepts=20,
 ):
     """
@@ -990,7 +1200,7 @@ def find_spurious_concepts(
     ft_reps_np = ft_reps.cpu().numpy()
 
     if activation_threshold is None:
-        activation_threshold = float(te_reps_np.mean())
+        activation_threshold = float(te_reps_np.mean()) 
         print(f"  activation_threshold (mean): {activation_threshold:.6f}")
 
     group_ids_arr = np.array([s[3] for s in test_ds.samples])
@@ -1022,6 +1232,10 @@ def find_spurious_concepts(
     group_top_sets   = {}
     group_prevalence = {}
     for gid_mis in [1, 2]:
+        # ensure keys always exist so plot functions don't KeyError on skipped groups
+        group_top_sets[gid_mis]   = set()
+        group_prevalence[gid_mis] = {}
+
         g_indices   = np.where(group_ids_arr == gid_mis)[0]
 
         # ── Build a group-filtered dataset with the same structure as test_ds ──
@@ -1065,7 +1279,7 @@ def find_spurious_concepts(
         # ── Concept prevalence among misclassified images ────────────────────
         mis_reps  = te_reps_np[misclassified]                               # (n_mis, L)
         prev      = (mis_reps > activation_threshold).sum(axis=0) / n_mis  # (L,) fraction — for filtering & diff
-        mean_prev = mis_reps.mean(axis=0)                                   # (L,) mean activation — for ranking
+        mean_rep = mis_reps.mean(axis=0)                                   # (L,) mean activation — for ranking
 
         eligible = np.where(prev > prevalence_threshold)[0]
         if len(eligible) == 0:
@@ -1075,10 +1289,10 @@ def find_spurious_concepts(
             continue
 
         # rank eligible concepts by mean activation (captures both magnitude and frequency)
-        pool_size    = int(len(eligible) * .3) # int(len(eligible) * .3) #len(eligible) # if len(eligible) < 3 else int(len(eligible) * .3)
+        pool_size    = len(eligible) #int(len(eligible) * .3) #len(eligible) # if len(eligible) < 3 else int(len(eligible) * .3)
         # top_concepts = eligible[np.argsort(mean_prev[eligible])[::-1]][:top_n_concepts]  # for report
-        mis_pool     = set(eligible[np.argsort(mean_prev[eligible])[::-1]][:pool_size].tolist())
-
+        mis_pool     = set(eligible[np.argsort(mean_rep[eligible])[::-1]][:pool_size].tolist())
+        # mis_pool     = set(eligible[np.argsort(mean_prev[eligible])[::-1]][:pool_size].tolist())
         # ── Aligned group definitions ────────────────────────────────────────
         # gid_mis=1 (landbird/water bg): HIGH in group 3 (waterbird/water, same bg)
         #                                LOW  in group 0 (landbird/land)
@@ -1090,10 +1304,27 @@ def find_spurious_concepts(
         low_reps  = te_reps_np[group_ids_arr == _aligned_low[gid_mis]]
 
         # ── Candidate concepts: top-in-misclassified ∩ low-in-aligned-low-group ──
-        low_aligned_mean = low_reps.mean(axis=0)
-        low_aligned_pool = set(np.argsort(low_aligned_mean)[:pool_size].tolist())
+        # low_aligned_mean = low_reps.mean(axis=0)
+        # low_aligned_pool = set(np.argsort(low_aligned_mean)[:pool_size].tolist())
 
-        candidate_concepts = list(mis_pool & low_aligned_pool)
+        ########Just new test: top misclassified concepts that are also low in the aligned low-bg group (intersection)########
+        # mis_reps  = te_reps_np[misclassified]                               # (n_mis, L)
+        n_aligned_low = low_reps.shape[0]
+        low_prev      = (low_reps < activation_threshold).sum(axis=0) / n_aligned_low  # (L,) fraction — for filtering & diff
+        low_eligible = np.where(low_prev > prevalence_threshold)[0]
+        low_aligned_mean = low_reps.mean(axis=0)                                   # (L,) mean activation — for ranking
+        low_aligned_pool = set(low_eligible[np.argsort(low_aligned_mean[low_eligible])[::-1]][:pool_size].tolist())
+
+        # ── High-aligned pool: concepts appearing in the majority of high_reps ─
+        n_aligned_high    = high_reps.shape[0]
+        high_prev         = (high_reps > activation_threshold).sum(axis=0) / n_aligned_high
+        high_eligible     = np.where(high_prev > prevalence_threshold)[0]
+        high_aligned_pool = set(high_eligible[np.argsort(high_prev[high_eligible])[::-1]][:pool_size].tolist())
+
+        candidate_concepts = list(mis_pool & low_aligned_pool & high_aligned_pool)
+        if not candidate_concepts:
+            candidate_concepts = list(mis_pool & low_aligned_pool)
+            print("  No mis∩low∩high intersection — falling back to mis∩low_aligned.")
         if not candidate_concepts:
             candidate_concepts = list(mis_pool)
             print("  No mis∩low_aligned intersection — using top misclassified pool.")
@@ -1223,6 +1454,7 @@ def find_spurious_concepts(
                 ft_row_title="FT set — lowest activation",
                 te_labels=te_labels_low,
                 ft_labels=ft_labels_low,
+                sae_dir=sae_dir,
             )
             print(f"  Concept {cid} [{cname}] lowest: "
                   f"test→test_images/lowest/*  ft→ft_images/lowest/*  plot→{low_plot_path}")
@@ -1273,7 +1505,566 @@ def find_spurious_concepts(
         f.write(report_text)
     print(f"\nSpurious concept report saved to {report_path}")
     
-    return all_candidate_concepts, top_concepts, concept_source_group, concept_mis_prevalence
+    return all_candidate_concepts, concept_source_group, concept_mis_prevalence
+
+
+def find_spurious_concepts_binary(
+    te_results, ft_results, test_ds, ft_ds,
+    concept_match_scores, vocab_names,
+    sae_dir, clip_ft,
+    active_threshold=0.7,
+    inactive_threshold=0.9,
+    top_n_concepts=10,
+):
+    """
+    Find spurious concepts using a direct binary active/inactive criterion:
+
+      spurious = {c : active(c, mis) > active_threshold}
+               ∩ {c : inactive(c, low_aligned) > inactive_threshold}
+
+    where
+      active(c, mis)          = fraction of misclassified images where latent c is non-zero
+      inactive(c, low_aligned)= fraction of aligned-low-bg images where latent c is zero
+
+    Because this uses sparse SAE latents (TopK-selected), non-zero means the SAE
+    explicitly selected that concept for the image.
+
+    Returns
+    -------
+    all_candidate_concepts  : list[int]
+    concept_source_group    : dict[int, int]   cid → gid_mis
+    concept_mis_prevalence  : dict[int, float] cid → active fraction in misclassified group
+    """
+    import shutil
+
+    te_reps_np = te_results["sae_representations"].cpu().numpy()
+    ft_reps_np = ft_results["sae_representations"].cpu().numpy()
+    te_paths   = te_results["image_paths"]
+    ft_paths   = ft_results["image_paths"]
+
+    group_ids_arr = np.array([s[3] for s in test_ds.samples])
+
+    MISALIGNED_GROUP_NAMES = {1: "landbird / water bg", 2: "waterbird / land bg"}
+    GROUP_FOLDER            = {1: "land_bird_on_water",  2: "water_bird_on_land"}
+    FT_CLASS_FOLDER         = {1: "water_birds",          2: "land_birds"}
+    _aligned_high           = {1: 3, 2: 0}
+    _aligned_low            = {1: 0, 2: 3}
+
+    all_candidate_concepts = []
+    concept_source_group   = {}
+    concept_mis_prevalence = {}
+    group_top_sets         = {}
+    group_prevalence       = {}
+
+    report_lines = [
+        "Spurious Concept Analysis — binary active/inactive",
+        f"active_threshold={active_threshold}  inactive_threshold={inactive_threshold}"
+        f"  |  Top {top_n_concepts} concepts",
+        "=" * 80,
+    ]
+
+    for gid_mis in [1, 2]:
+        group_top_sets[gid_mis]   = set()
+        group_prevalence[gid_mis] = {}
+
+        g_indices = np.where(group_ids_arr == gid_mis)[0]
+
+        group_ds = ManifestDataset.__new__(ManifestDataset)
+        group_ds.samples         = [test_ds.samples[i] for i in g_indices]
+        group_ds.clip_preprocess = clip_ft.preprocess
+        group_ds.manifest_path   = test_ds.manifest_path
+
+        print(f"\nClassifying Group {gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — {len(g_indices)} images …")
+        zs_stats = clip_ft.run(dataset=group_ds, prompt_mode="shape", dataset_name="waterbirds")
+        mis_local     = np.where(
+            np.array(zs_stats["predictions_shape"]) != np.array(zs_stats["true_labels"])
+        )[0]
+        misclassified = g_indices[mis_local].tolist()
+        n_mis         = len(misclassified)
+        print(f"  Misclassified: {n_mis} / {len(g_indices)}")
+
+        report_lines.append(
+            f"\n{'─'*80}\n"
+            f"Group {gid_mis} — {MISALIGNED_GROUP_NAMES[gid_mis]}\n"
+            f"Misclassified: {n_mis} / {len(g_indices)}"
+        )
+
+        if n_mis == 0:
+            report_lines.append("  No misclassified images — skipping.")
+            continue
+
+        mis_reps  = te_reps_np[misclassified]
+        low_reps  = te_reps_np[group_ids_arr == _aligned_low[gid_mis]]
+
+        # fraction of misclassified images where concept is non-zero (active)
+        active_rate = (mis_reps != 0).mean(axis=0)            # (L,)
+        # fraction of aligned-low images where concept is zero (inactive)
+        inactive_rate_low = (low_reps == 0).mean(axis=0)      # (L,)
+
+        active_in_mis   = set(np.where(active_rate      > active_threshold)[0].tolist())
+        inactive_in_low = set(np.where(inactive_rate_low > inactive_threshold)[0].tolist())
+        spurious        = active_in_mis & inactive_in_low
+
+        report_lines.append(
+            f"  Active in >{active_threshold*100:.0f}% of misclassified: {len(active_in_mis)}\n"
+            f"  Inactive in >{inactive_threshold*100:.0f}% of aligned-low: {len(inactive_in_low)}\n"
+            f"  Intersection (spurious candidates): {len(spurious)}"
+        )
+
+        if not spurious:
+            report_lines.append("  No concepts meet the active∩inactive criterion — skipping.")
+            continue
+
+        # rank by activity rate in misclassified (highest first)
+        spurious_sorted = sorted(spurious, key=lambda c: active_rate[c], reverse=True)
+        all_candidate_concepts.extend(spurious_sorted)
+        for cid in spurious_sorted:
+            concept_source_group[cid]   = gid_mis
+            concept_mis_prevalence[cid] = float(active_rate[cid])
+
+        top_concepts = spurious_sorted[:top_n_concepts]
+        group_top_sets[gid_mis]   = set(top_concepts)
+        group_prevalence[gid_mis] = {c: float(active_rate[c]) for c in top_concepts}
+
+        report_lines += [
+            f"\n{'Concept ID':<12}  {'Concept Name':<30}  "
+            f"{'Active in Mis':>14}  {'Inactive in Low':>16}",
+            "-" * 78,
+        ]
+        for cid in top_concepts:
+            cname = vocab_names[concept_match_scores[:, cid].argmax()]
+            report_lines.append(
+                f"{cid:<12}  {cname:<30}  "
+                f"{active_rate[cid]*100:>13.1f}%  {inactive_rate_low[cid]*100:>15.1f}%"
+            )
+
+        # ── Save example images per concept ──────────────────────────────────
+        group_folder    = GROUP_FOLDER[gid_mis]
+        ft_class_folder = FT_CLASS_FOLDER[gid_mis]
+
+        for cid in top_concepts:
+            cname    = vocab_names[concept_match_scores[:, cid].argmax()]
+            test_out = os.path.join(sae_dir, "test_images", "spurious_binary", group_folder)
+            ft_out   = os.path.join(sae_dir, "ft_images",  "spurious_binary", ft_class_folder)
+            os.makedirs(test_out, exist_ok=True)
+            os.makedirs(ft_out,   exist_ok=True)
+
+            active_mis = sorted(
+                [idx for idx in misclassified if te_reps_np[idx, cid] != 0],
+                key=lambda idx: te_reps_np[idx, cid], reverse=True,
+            )
+            for idx in active_mis[:10]:
+                shutil.copy2(te_paths[idx],
+                             os.path.join(test_out, os.path.basename(te_paths[idx])))
+
+            active_ft = sorted(
+                [i for i in range(len(ft_paths)) if ft_reps_np[i, cid] != 0],
+                key=lambda i: ft_reps_np[i, cid], reverse=True,
+            )
+            for i in active_ft[:10]:
+                shutil.copy2(ft_paths[i],
+                             os.path.join(ft_out, os.path.basename(ft_paths[i])))
+
+            plot_path = plot_concept_top_images(
+                cid=cid, cname=cname,
+                group_label=f"Grp{gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]})",
+                top10_te_indices=active_mis[:10],
+                top10_ft_indices=active_ft[:10],
+                te_paths=te_paths, ft_paths=ft_paths,
+                te_reps_np=te_reps_np, ft_reps_np=ft_reps_np,
+                test_save_dir=test_out, ft_save_dir=ft_out,
+            )
+            print(f"  Concept {cid} [{cname}]: test→{test_out}  ft→{ft_out}  plot→{plot_path}")
+
+            # ── Lowest-activation (zero) images ──────────────────────────────
+            _te_grp_folders = {
+                0: "landbird_land_bg", 1: "landbird_water_bg",
+                2: "waterbird_land_bg", 3: "waterbird_water_bg",
+            }
+            _ft_lbl_folders = {0: "land_birds", 1: "water_birds"}
+
+            bottom_te = np.argsort(te_reps_np[:, cid])[:10]
+            bottom_ft = np.argsort(ft_reps_np[:, cid])[:10]
+
+            for idx in bottom_te:
+                actual_gid    = test_ds.samples[idx][3]
+                actual_folder = _te_grp_folders.get(actual_gid, f"group_{actual_gid}")
+                dest = os.path.join(sae_dir, "test_images", "lowest", actual_folder)
+                os.makedirs(dest, exist_ok=True)
+                shutil.copy2(te_paths[idx],
+                             os.path.join(dest, os.path.basename(te_paths[idx])))
+
+            for i in bottom_ft:
+                actual_label  = ft_ds.samples[i][1]
+                actual_folder = _ft_lbl_folders.get(actual_label, f"label_{actual_label}")
+                dest = os.path.join(sae_dir, "ft_images", "lowest", actual_folder)
+                os.makedirs(dest, exist_ok=True)
+                shutil.copy2(ft_paths[i],
+                             os.path.join(dest, os.path.basename(ft_paths[i])))
+
+            te_labels_low = [
+                _te_grp_folders.get(test_ds.samples[idx][3], f"grp{test_ds.samples[idx][3]}")
+                for idx in bottom_te
+            ]
+            ft_labels_low = [
+                _ft_lbl_folders.get(ft_ds.samples[i][1], f"lbl{ft_ds.samples[i][1]}")
+                for i in bottom_ft
+            ]
+
+            test_plot_dir = os.path.join(sae_dir, "test_images", "lowest", "plots")
+            ft_plot_dir   = os.path.join(sae_dir, "ft_images",   "lowest", "plots")
+            os.makedirs(test_plot_dir, exist_ok=True)
+            os.makedirs(ft_plot_dir,   exist_ok=True)
+            low_plot_path = plot_concept_top_images(
+                cid=cid, cname=cname,
+                group_label=f"Grp{gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — Lowest",
+                top10_te_indices=bottom_te.tolist(),
+                top10_ft_indices=bottom_ft.tolist(),
+                te_paths=te_paths, ft_paths=ft_paths,
+                te_reps_np=te_reps_np, ft_reps_np=ft_reps_np,
+                test_save_dir=test_plot_dir, ft_save_dir=ft_plot_dir,
+                te_row_title="Test (all) — lowest activation",
+                ft_row_title="FT set — lowest activation",
+                te_labels=te_labels_low,
+                ft_labels=ft_labels_low,
+            )
+            print(f"  Concept {cid} [{cname}] lowest: "
+                  f"test→test_images/lowest/*  ft→ft_images/lowest/*  plot→{low_plot_path}")
+
+    # ── Build aligned-group sets for plot functions ───────────────────────────
+    for gid_aln, gid_mis_pair in [(3, 1), (0, 2)]:
+        paired = group_top_sets.get(gid_mis_pair, set())
+        group_top_sets[gid_aln] = paired
+        aln_reps = te_reps_np[group_ids_arr == gid_aln]
+        group_prevalence[gid_aln] = (
+            {c: float((aln_reps[:, c] != 0).mean()) for c in paired}
+            if len(aln_reps) else {}
+        )
+
+    device         = next(clip_ft.model.parameters()).device
+    group_ids_list = [s[3] for s in test_ds.samples]
+
+    plot_misaligned_concept_images(
+        results=te_results, group_ids=group_ids_list,
+        group_top_sets=group_top_sets, group_prevalence=group_prevalence,
+        concept_match_scores=concept_match_scores, vocab_names=vocab_names,
+        sae_dir=sae_dir, clip_ft=clip_ft, device=device, top_n_concepts=top_n_concepts,
+    )
+    plot_misaligned_vs_fttrain_concept_images(
+        te_results=te_results, ft_results=ft_results, group_ids_te=group_ids_list,
+        group_top_sets=group_top_sets, group_prevalence=group_prevalence,
+        concept_match_scores=concept_match_scores, vocab_names=vocab_names,
+        sae_dir=sae_dir, clip_ft=clip_ft, device=device, top_n_concepts=top_n_concepts,
+    )
+
+    report_text = "\n".join(report_lines) + "\n"
+    report_path = os.path.join(sae_dir, "spurious_concepts_binary_report.txt")
+    with open(report_path, "w") as f:
+        f.write(report_text)
+    print(f"\nSpurious concept binary report saved to {report_path}")
+
+    return all_candidate_concepts, concept_source_group, concept_mis_prevalence
+
+
+
+
+def find_and_show_spurious_concepts_binary(
+    te_results, ft_results, test_ds, ft_ds,
+    concept_match_scores, vocab_names,
+    sae_dir, clip_ft,
+    active_threshold=0.7,
+    inactive_threshold=0.9,
+    top_n_concepts=10,
+    sae_model= None,
+    device = None,
+):
+    """
+    Find spurious concepts using a direct binary active/inactive criterion:
+
+      spurious = {c : active(c, mis) > active_threshold}
+               ∩ {c : inactive(c, low_aligned) > inactive_threshold}
+
+    where
+      active(c, mis)          = fraction of misclassified images where latent c is non-zero
+      inactive(c, low_aligned)= fraction of aligned-low-bg images where latent c is zero
+
+    Because this uses sparse SAE latents (TopK-selected), non-zero means the SAE
+    explicitly selected that concept for the image.
+
+    Returns
+    -------
+    all_candidate_concepts  : list[int]
+    concept_source_group    : dict[int, int]   cid → gid_mis
+    concept_mis_prevalence  : dict[int, float] cid → active fraction in misclassified group
+    """
+    import shutil
+
+    te_reps_np = te_results["sae_representations"].cpu().numpy()
+    ft_reps_np = ft_results["sae_representations"].cpu().numpy()
+    te_paths   = te_results["image_paths"]
+    ft_paths   = ft_results["image_paths"]
+
+    if device is None:
+        device = next(clip_ft.model.parameters()).device
+
+    group_ids_arr = np.array([s[3] for s in test_ds.samples])
+
+    MISALIGNED_GROUP_NAMES = {1: "landbird / water bg", 2: "waterbird / land bg"}
+    GROUP_FOLDER            = {1: "land_bird_on_water",  2: "water_bird_on_land"}
+    FT_CLASS_FOLDER         = {1: "water_birds",          2: "land_birds"}
+    _aligned_high           = {1: 3, 2: 0}
+    _aligned_low            = {1: 0, 2: 3}
+
+    all_candidate_concepts = []
+    concept_source_group   = {}
+    concept_mis_prevalence = {}
+    group_top_sets         = {}
+    group_prevalence       = {}
+
+    report_lines = [
+        "Spurious Concept Analysis — binary active/inactive",
+        f"active_threshold={active_threshold}  inactive_threshold={inactive_threshold}"
+        f"  |  Top {top_n_concepts} concepts",
+        "=" * 80,
+    ]
+
+    for gid_mis in [1, 2]:
+        group_top_sets[gid_mis]   = set()
+        group_prevalence[gid_mis] = {}
+
+        g_indices = np.where(group_ids_arr == gid_mis)[0]
+
+        group_ds = ManifestDataset.__new__(ManifestDataset)
+        group_ds.samples         = [test_ds.samples[i] for i in g_indices]
+        group_ds.clip_preprocess = clip_ft.preprocess
+        group_ds.manifest_path   = test_ds.manifest_path
+
+        print(f"\nClassifying Group {gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — {len(g_indices)} images …")
+        zs_stats = clip_ft.run(dataset=group_ds, prompt_mode="shape", dataset_name="waterbirds")
+        mis_local     = np.where(
+            np.array(zs_stats["predictions_shape"]) != np.array(zs_stats["true_labels"])
+        )[0]
+        misclassified = g_indices[mis_local].tolist()
+        n_mis         = len(misclassified)
+        print(f"  Misclassified: {n_mis} / {len(g_indices)}")
+
+        report_lines.append(
+            f"\n{'─'*80}\n"
+            f"Group {gid_mis} — {MISALIGNED_GROUP_NAMES[gid_mis]}\n"
+            f"Misclassified: {n_mis} / {len(g_indices)}"
+        )
+
+        if n_mis == 0:
+            report_lines.append("  No misclassified images — skipping.")
+            continue
+
+        mis_reps  = te_reps_np[misclassified]
+        low_reps  = te_reps_np[group_ids_arr == _aligned_low[gid_mis]]
+
+        # fraction of misclassified images where concept is non-zero (active)
+        active_rate = (mis_reps != 0).mean(axis=0)            # (L,)
+        # fraction of aligned-low images where concept is zero (inactive)
+        inactive_rate_low = (low_reps == 0).mean(axis=0)      # (L,)
+
+        active_in_mis   = set(np.where(active_rate      > active_threshold)[0].tolist())
+        inactive_in_low = set(np.where(inactive_rate_low > inactive_threshold)[0].tolist())
+        spurious        = active_in_mis & inactive_in_low
+
+        report_lines.append(
+            f"  Active in >{active_threshold*100:.0f}% of misclassified: {len(active_in_mis)}\n"
+            f"  Inactive in >{inactive_threshold*100:.0f}% of aligned-low: {len(inactive_in_low)}\n"
+            f"  Intersection (spurious candidates): {len(spurious)}"
+        )
+
+        if not spurious:
+            report_lines.append("  No concepts meet the active∩inactive criterion — skipping.")
+            continue
+
+        # rank by activity rate in misclassified (highest first)
+        spurious_sorted = sorted(spurious, key=lambda c: active_rate[c], reverse=True)
+        all_candidate_concepts.extend(spurious_sorted)
+        for cid in spurious_sorted:
+            concept_source_group[cid]   = gid_mis
+            concept_mis_prevalence[cid] = float(active_rate[cid])
+
+        top_concepts = spurious_sorted[:top_n_concepts]
+        group_top_sets[gid_mis]   = set(top_concepts)
+        group_prevalence[gid_mis] = {c: float(active_rate[c]) for c in top_concepts}
+
+        report_lines += [
+            f"\n{'Concept ID':<12}  {'Concept Name':<30}  "
+            f"{'Active in Mis':>14}  {'Inactive in Low':>16}",
+            "-" * 78,
+        ]
+        for cid in top_concepts:
+            cname = vocab_names[concept_match_scores[:, cid].argmax()]
+            report_lines.append(
+                f"{cid:<12}  {cname:<30}  "
+                f"{active_rate[cid]*100:>13.1f}%  {inactive_rate_low[cid]*100:>15.1f}%"
+            )
+
+        # ── Save example images per concept ──────────────────────────────────
+        group_folder    = GROUP_FOLDER[gid_mis]
+        ft_class_folder = FT_CLASS_FOLDER[gid_mis]
+
+        
+
+        for cid in top_concepts:
+            cname    = vocab_names[concept_match_scores[:, cid].argmax()]
+            test_out = os.path.join(sae_dir, "test_images", "spurious_binary", group_folder)
+            ft_out   = os.path.join(sae_dir, "ft_images",  "spurious_binary", ft_class_folder)
+            os.makedirs(test_out, exist_ok=True)
+            os.makedirs(ft_out,   exist_ok=True)
+
+
+            # visualize_concepts_on_images(
+            #     image_paths=te_results["image_paths"],
+            #     clip_ft=clip_ft,
+            #     sae_model=sae_model,
+            #     concept_ids=candidate_concepts,
+            #     device=next(clip_ft.model.parameters()).device,
+            #     concept_match_scores=concept_match_scores,
+            #     vocab_names=vocab_names,
+            # )
+            active_mis = sorted(
+                [idx for idx in misclassified if te_reps_np[idx, cid] != 0],
+                key=lambda idx: te_reps_np[idx, cid], reverse=True,
+            )
+            for idx in active_mis[:10]:
+                shutil.copy2(te_paths[idx],
+                             os.path.join(test_out, os.path.basename(te_paths[idx])))
+            top_mis_indices = active_mis[:10]
+            toptest_paths   = [te_paths[idx] for idx in top_mis_indices]
+            toptest_reps    = te_reps_np[top_mis_indices]
+            visualize_concepts_on_images(
+                image_paths=toptest_paths,
+                clip_ft=clip_ft,
+                sae_model=sae_model,
+                concept_ids=cid,
+                device=device,
+                concept_match_scores=concept_match_scores,
+                vocab_names=vocab_names,
+                group_name=MISALIGNED_GROUP_NAMES[gid_mis],
+                sae_representations=toptest_reps,
+                save_dir=test_out,
+            )
+
+            active_ft = sorted(
+                [i for i in range(len(ft_paths)) if ft_reps_np[i, cid] != 0],
+                key=lambda i: ft_reps_np[i, cid], reverse=True,
+            )
+            for i in active_ft[:10]:
+                shutil.copy2(ft_paths[i],
+                             os.path.join(ft_out, os.path.basename(ft_paths[i])))
+
+            top_ft_indices = active_ft[:10]
+            topft_paths    = [ft_paths[i] for i in top_ft_indices]
+            topft_reps     = ft_reps_np[top_ft_indices]
+            visualize_concepts_on_images(
+                image_paths=topft_paths,
+                clip_ft=clip_ft,
+                sae_model=sae_model,
+                concept_ids=cid,
+                device=device,
+                concept_match_scores=concept_match_scores,
+                vocab_names=vocab_names,
+                group_name=f"FT — {MISALIGNED_GROUP_NAMES[gid_mis]}",
+                sae_representations=topft_reps,
+                save_dir=ft_out,
+            )
+            # ── Lowest-activation (zero) images ──────────────────────────────
+            _te_grp_folders = {
+                0: "landbird_land_bg", 1: "landbird_water_bg",
+                2: "waterbird_land_bg", 3: "waterbird_water_bg",
+            }
+            _ft_lbl_folders = {0: "land_birds", 1: "water_birds"}
+
+            # bottom_te = np.argsort(te_reps_np[:, cid])[:10]
+            # bottom_ft = np.argsort(ft_reps_np[:, cid])[:10]
+
+            # for idx in bottom_te:
+            #     actual_gid    = test_ds.samples[idx][3]
+            #     actual_folder = _te_grp_folders.get(actual_gid, f"group_{actual_gid}")
+            #     dest = os.path.join(sae_dir, "test_images", "lowest", actual_folder)
+            #     os.makedirs(dest, exist_ok=True)
+            #     shutil.copy2(te_paths[idx],
+            #                  os.path.join(dest, os.path.basename(te_paths[idx])))
+
+            # for i in bottom_ft:
+            #     actual_label  = ft_ds.samples[i][1]
+            #     actual_folder = _ft_lbl_folders.get(actual_label, f"label_{actual_label}")
+            #     dest = os.path.join(sae_dir, "ft_images", "lowest", actual_folder)
+            #     os.makedirs(dest, exist_ok=True)
+            #     shutil.copy2(ft_paths[i],
+            #                  os.path.join(dest, os.path.basename(ft_paths[i])))
+
+            # te_labels_low = [
+            #     _te_grp_folders.get(test_ds.samples[idx][3], f"grp{test_ds.samples[idx][3]}")
+            #     for idx in bottom_te
+            # ]
+            # ft_labels_low = [
+            #     _ft_lbl_folders.get(ft_ds.samples[i][1], f"lbl{ft_ds.samples[i][1]}")
+            #     for i in bottom_ft
+            # ]
+
+            # test_plot_dir = os.path.join(sae_dir, "test_images", "lowest", "plots")
+            # ft_plot_dir   = os.path.join(sae_dir, "ft_images",   "lowest", "plots")
+            # os.makedirs(test_plot_dir, exist_ok=True)
+            # os.makedirs(ft_plot_dir,   exist_ok=True)
+            # low_plot_path = plot_concept_top_images(
+            #     cid=cid, cname=cname,
+            #     group_label=f"Grp{gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — Lowest",
+            #     top10_te_indices=bottom_te.tolist(),
+            #     top10_ft_indices=bottom_ft.tolist(),
+            #     te_paths=te_paths, ft_paths=ft_paths,
+            #     te_reps_np=te_reps_np, ft_reps_np=ft_reps_np,
+            #     test_save_dir=test_plot_dir, ft_save_dir=ft_plot_dir,
+            #     te_row_title="Test (all) — lowest activation",
+            #     ft_row_title="FT set — lowest activation",
+            #     te_labels=te_labels_low,
+            #     ft_labels=ft_labels_low,
+            # )
+            # print(f"  Concept {cid} [{cname}] lowest: "
+            #       f"test→test_images/lowest/*  ft→ft_images/lowest/*  plot→{low_plot_path}")
+
+    # ── Build aligned-group sets for plot functions ───────────────────────────
+    for gid_aln, gid_mis_pair in [(3, 1), (0, 2)]:
+        paired = group_top_sets.get(gid_mis_pair, set())
+        group_top_sets[gid_aln] = paired
+        aln_reps = te_reps_np[group_ids_arr == gid_aln]
+        group_prevalence[gid_aln] = (
+            {c: float((aln_reps[:, c] != 0).mean()) for c in paired}
+            if len(aln_reps) else {}
+        )
+
+    device         = next(clip_ft.model.parameters()).device
+    group_ids_list = [s[3] for s in test_ds.samples]
+
+    # plot_misaligned_concept_images(
+    #     results=te_results, group_ids=group_ids_list,
+    #     group_top_sets=group_top_sets, group_prevalence=group_prevalence,
+    #     concept_match_scores=concept_match_scores, vocab_names=vocab_names,
+    #     sae_dir=sae_dir, clip_ft=clip_ft, device=device, top_n_concepts=top_n_concepts,
+    # )
+    # plot_misaligned_vs_fttrain_concept_images(
+    #     te_results=te_results, ft_results=ft_results, group_ids_te=group_ids_list,
+    #     group_top_sets=group_top_sets, group_prevalence=group_prevalence,
+    #     concept_match_scores=concept_match_scores, vocab_names=vocab_names,
+    #     sae_dir=sae_dir, clip_ft=clip_ft, device=device, top_n_concepts=top_n_concepts,
+    # )
+
+    report_text = "\n".join(report_lines) + "\n"
+    report_path = os.path.join(sae_dir, "spurious_concepts_binary_report.txt")
+    with open(report_path, "w") as f:
+        f.write(report_text)
+    print(f"\nSpurious concept binary report saved to {report_path}")
+
+    
+    return all_candidate_concepts, concept_source_group, concept_mis_prevalence
+
+
+
+
 
 
 def make_projection_ablation_hook(dirs):
@@ -1521,6 +2312,49 @@ def ablate_spurious_concepts(
         plt.close()
         print(f"  Saved corrected plot (group {gid}): {fpath}")
 
+        # LRP heatmaps for corrected images — prompt = true class name
+        corrected_images = [_PIL.open(test_ds.samples[i][0]).convert("RGB") for i in top_idx]
+        corrected_prompts = [CLASS_NAMES[true_labels[i]] for i in top_idx]
+        with torch.enable_grad():
+            heatmap_results = generate_clip_heatmaps(corrected_images, corrected_prompts, clip_ft)
+        fig, axes = plt.subplots(2, top_k, figsize=(2.5 * top_k, 5), squeeze=False)
+        fig.suptitle(
+            f"Group {gid} ({GROUP_NAMES.get(gid, str(gid))}) — corrected: original | heatmap",
+            fontsize=10, fontweight="bold",
+        )
+        for col, (img_pil, hr) in enumerate(zip(corrected_images, heatmap_results)):
+            axes[0, col].imshow(img_pil)
+            axes[0, col].axis("off")
+            axes[0, col].set_title(corrected_prompts[col], fontsize=7)
+            axes[1, col].imshow(hr["heatmap_rgb"])
+            axes[1, col].axis("off")
+            axes[1, col].set_title(f"sim={hr['similarity']:.2f}", fontsize=7)
+        plt.tight_layout()
+        hfpath = os.path.join(sae_dir, f"ablation_corrected_heatmap_group{gid}.png")
+        plt.savefig(hfpath, bbox_inches="tight", dpi=120)
+        plt.close()
+        print(f"  Saved corrected heatmap (group {gid}): {hfpath}")
+
+        # Occlusion saliency for corrected images — compare with LRP above
+        saliency_results = generate_clip_saliency(corrected_images, corrected_prompts, clip_ft)
+        fig, axes = plt.subplots(2, top_k, figsize=(2.5 * top_k, 5), squeeze=False)
+        fig.suptitle(
+            f"Group {gid} ({GROUP_NAMES.get(gid, str(gid))}) — corrected: original | saliency",
+            fontsize=10, fontweight="bold",
+        )
+        for col, (img_pil, sr) in enumerate(zip(corrected_images, saliency_results)):
+            axes[0, col].imshow(img_pil)
+            axes[0, col].axis("off")
+            axes[0, col].set_title(corrected_prompts[col], fontsize=7)
+            axes[1, col].imshow(sr["heatmap_rgb"])
+            axes[1, col].axis("off")
+            axes[1, col].set_title(f"sim={sr['similarity']:.2f}", fontsize=7)
+        plt.tight_layout()
+        sfpath = os.path.join(sae_dir, f"ablation_corrected_saliency_group{gid}.png")
+        plt.savefig(sfpath, bbox_inches="tight", dpi=120)
+        plt.close()
+        print(f"  Saved corrected saliency (group {gid}): {sfpath}")
+
     # ── Harmed-images plots for aligned groups 0 and 3 ───────────────────────
     # Images that were correct before ablation but wrong after (collateral damage).
     # Ranked by biggest drop in the true-class logit.
@@ -1572,6 +2406,49 @@ def ablate_spurious_concepts(
         plt.close()
         print(f"  Saved harmed plot (group {gid}): {fpath}")
 
+        # LRP heatmaps for harmed images — prompt = true class name
+        harmed_images  = [_PIL.open(test_ds.samples[i][0]).convert("RGB") for i in top_idx]
+        harmed_prompts = [CLASS_NAMES[true_labels[i]] for i in top_idx]
+        with torch.enable_grad():
+            heatmap_results = generate_clip_heatmaps(harmed_images, harmed_prompts, clip_ft)
+        fig, axes = plt.subplots(2, top_k, figsize=(2.5 * top_k, 5), squeeze=False)
+        fig.suptitle(
+            f"Group {gid} ({GROUP_NAMES.get(gid, str(gid))}) — harmed: original | heatmap",
+            fontsize=10, fontweight="bold",
+        )
+        for col, (img_pil, hr) in enumerate(zip(harmed_images, heatmap_results)):
+            axes[0, col].imshow(img_pil)
+            axes[0, col].axis("off")
+            axes[0, col].set_title(harmed_prompts[col], fontsize=7)
+            axes[1, col].imshow(hr["heatmap_rgb"])
+            axes[1, col].axis("off")
+            axes[1, col].set_title(f"sim={hr['similarity']:.2f}", fontsize=7)
+        plt.tight_layout()
+        hfpath = os.path.join(sae_dir, f"ablation_harmed_heatmap_group{gid}.png")
+        plt.savefig(hfpath, bbox_inches="tight", dpi=120)
+        plt.close()
+        print(f"  Saved harmed heatmap (group {gid}): {hfpath}")
+
+        # Occlusion saliency for harmed images — compare with LRP above
+        saliency_results = generate_clip_saliency(harmed_images, harmed_prompts, clip_ft)
+        fig, axes = plt.subplots(2, top_k, figsize=(2.5 * top_k, 5), squeeze=False)
+        fig.suptitle(
+            f"Group {gid} ({GROUP_NAMES.get(gid, str(gid))}) — harmed: original | saliency",
+            fontsize=10, fontweight="bold",
+        )
+        for col, (img_pil, sr) in enumerate(zip(harmed_images, saliency_results)):
+            axes[0, col].imshow(img_pil)
+            axes[0, col].axis("off")
+            axes[0, col].set_title(harmed_prompts[col], fontsize=7)
+            axes[1, col].imshow(sr["heatmap_rgb"])
+            axes[1, col].axis("off")
+            axes[1, col].set_title(f"sim={sr['similarity']:.2f}", fontsize=7)
+        plt.tight_layout()
+        sfpath = os.path.join(sae_dir, f"ablation_harmed_saliency_group{gid}.png")
+        plt.savefig(sfpath, bbox_inches="tight", dpi=120)
+        plt.close()
+        print(f"  Saved harmed saliency (group {gid}): {sfpath}")
+
 
 def save_representations(results, split_name, run_dir):
     """Save representation tensors and per-image metrics to the run folder."""
@@ -1591,6 +2468,256 @@ def save_representations(results, split_name, run_dir):
 
     print(f"  Saved representations ({split_name}): {out}")
     return out
+
+
+def visualize_concepts_on_images(
+    image_paths,
+    clip_ft,
+    sae_model,
+    concept_ids,
+    device,
+    concept_match_scores=None,
+    vocab_names=None,
+    max_images=10,
+    save_dir=None,
+    group_name=None,
+    sae_representations=None,
+):
+    """
+    For each concept, plot all images in two horizontal rows:
+      Row 0: original images, titled with their concept activation value
+      Row 1: heatmap overlays
+    Saves one file per concept to save_dir.
+    """
+    import matplotlib.pyplot as plt
+    from overcomplete.visualization.plot_utils import show, interpolate_cv2, get_image_dimensions
+
+    if isinstance(concept_ids, (int, np.integer)):
+        concept_ids = [concept_ids]
+    image_paths = list(image_paths)[:max_images]
+    n_images    = len(image_paths)
+
+    sae_reps = None
+    if sae_representations is not None:
+        sae_reps = sae_representations[:n_images]   # align to sliced paths
+
+    for cid in concept_ids:
+        cname = (
+            vocab_names[concept_match_scores[:, cid].argmax()]
+            if vocab_names is not None and concept_match_scores is not None
+            else str(cid)
+        )
+
+        # Collect (img_pil, heatmap) per image
+        panels = []
+        for path in image_paths:
+            result = concept_spatial_heatmap(
+                image_path=path,
+                clip_ft=clip_ft,
+                sae_model=sae_model,
+                concept_id=cid,
+                device=device,
+                concept_match_scores=concept_match_scores,
+                vocab_names=vocab_names,
+                return_only=True,
+            )
+            if result is not None:
+                panels.append(result)
+
+        if not panels:
+            continue
+
+        # Layout: 2 rows × n_images columns
+        fig, axes = plt.subplots(2, n_images, figsize=(3 * n_images, 6))
+        if n_images == 1:
+            axes = [[axes[0]], [axes[1]]]
+
+        title = f"Concept {cid}: {cname}"
+        if group_name:
+            title = f"{group_name} — {title}"
+        fig.suptitle(title, fontsize=12)
+
+        for col, (img_pil, heatmap) in enumerate(panels):
+            width, height = get_image_dimensions(img_pil)
+            heatmap_up    = interpolate_cv2(heatmap, (width, height))
+
+            # Row 0: original image + activation value as title
+            plt.sca(axes[0][col])
+            show(img_pil)
+            axes[0][col].axis("off")
+            if sae_reps is not None:
+                act_val = float(sae_reps[col, cid])
+                axes[0][col].set_title(f"act={act_val:.3f}", fontsize=8)
+
+            # Row 1: heatmap overlay
+            plt.sca(axes[1][col])
+            show(img_pil)
+            show(heatmap_up, cmap="jet", alpha=0.5)
+            axes[1][col].axis("off")
+
+        plt.tight_layout()
+
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"concept_{cid}_{cname}.png")
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"  Saved heatmap grid → {save_path}")
+
+        # plt.show()
+
+
+def visualize_top_k_concept_images(
+    image_paths,
+    sae_representations,
+    clip_ft,
+    sae_model,
+    concept_ids,
+    device,
+    k=10,
+    concept_match_scores=None,
+    vocab_names=None,
+):
+    """For each concept, find the k images with highest activation and show patch heatmaps."""
+    from PIL import Image as _PIL
+
+    image_paths = list(image_paths)
+    vis = clip_ft.model.visual
+
+    for cid in concept_ids:
+        cname = (
+            vocab_names[concept_match_scores[:, cid].argmax()]
+            if vocab_names is not None and concept_match_scores is not None
+            else str(cid)
+        )
+
+        # Select top-k images by global SAE activation for this concept
+        top_indices = np.argsort(sae_representations[:, cid])[::-1][:k]
+        selected_paths = [image_paths[i] for i in top_indices]
+        images_pil = [_PIL.open(p).convert("RGB") for p in selected_paths]
+        images_t   = torch.stack([clip_ft.preprocess(img) for img in images_pil]).to(device)
+
+        # Extract patch tokens via hook on last transformer block
+        _patch_tokens = []
+        def _capture_hook(_m, _i, output):
+            _patch_tokens.append(output.permute(1, 0, 2).detach())
+
+        hook = vis.transformer.resblocks[-1].register_forward_hook(_capture_hook)
+        with torch.no_grad():
+            clip_ft.model.encode_image(images_t)
+        hook.remove()
+
+        patch_feats = _patch_tokens[0][:, 1:, :]   # drop CLS → [k, n_patches, d_hidden]
+
+        # Project to CLIP output space to match SAE input dim
+        with torch.no_grad():
+            patch_feats = vis.ln_post(patch_feats)
+            if vis.proj is not None:
+                patch_feats = patch_feats @ vis.proj
+
+        print(f"Concept {cid}: {cname}  (top-{k} images)")
+        for path in selected_paths:
+            concept_spatial_heatmap(
+                image_path=path,
+                clip_ft=clip_ft,
+                sae_model=sae_model,
+                concept_id=cid,
+                device=device,
+                concept_match_scores=concept_match_scores,
+                vocab_names=vocab_names,
+            )
+
+
+def concept_spatial_heatmap(
+    image_path,
+    clip_ft,
+    sae_model,
+    concept_id,
+    device,
+    concept_match_scores=None,
+    vocab_names=None,
+    return_only=False,
+):
+    """
+    Attribute a concept's activation back to spatial image patches using gradients.
+
+    Uses the same global-embedding SAE that was used for concept extraction:
+      image → CLIP CLS embedding → SAE → concept activation
+                     ↑ gradient flows back to patch tokens in last transformer block
+
+    Returns heatmap of shape [grid_h, grid_w] (7×7 for ViT-B/32, 14×14 for ViT-B/16).
+    """
+    import math
+    import matplotlib.pyplot as plt
+    from PIL import Image as _PIL
+
+    cname = (
+        vocab_names[concept_match_scores[:, concept_id].argmax()]
+        if vocab_names is not None and concept_match_scores is not None
+        else str(concept_id)
+    )
+
+    img_pil = _PIL.open(image_path).convert("RGB")
+    img_t   = clip_ft.preprocess(img_pil).unsqueeze(0).to(device)
+
+    vis = clip_ft.model.visual
+
+    # Hook the INPUT to the last transformer block (pre-hook).
+    # Patch tokens here still influence the CLS output through the last block's
+    # self-attention, so gradients from the concept activation flow back to them.
+    # Hooking the OUTPUT instead gives zero patch-token gradients because encode_image
+    # discards all positions except CLS (index 0) after the last block.
+    from overcomplete.visualization.plot_utils import show, interpolate_cv2, get_image_dimensions
+
+    # Hook conv1 (patch embedding layer) — its output is a leaf-adjacent node in the
+    # computation graph (conv1 has learnable weights), so retain_grad() reliably works here.
+    # Shape: [1, d_hidden, grid_h, grid_w]
+    _patch_embeds = []
+    def _embed_hook(_m, _i, output):
+        output.retain_grad()
+        _patch_embeds.append(output)
+
+    hook = vis.conv1.register_forward_hook(_embed_hook)
+
+    clip_ft.model.zero_grad()
+    feat = clip_ft.model.encode_image(img_t).float()   # [1, 512]
+    hook.remove()
+
+    # Run through SAE and get the specific concept's activation
+    sparse_codes, _ = sae_model.encode(feat)           # [1, d_sae]
+    concept_activation = sparse_codes[0, concept_id]
+
+    concept_activation.backward()
+
+    # grads: [d_hidden, grid_h, grid_w] — mean abs gradient across channels per patch
+    grads   = _patch_embeds[0].grad[0]                 # [d_hidden, grid_h, grid_w]
+    heatmap = grads.abs().mean(dim=0)                  # [grid_h, grid_w]
+    heatmap = torch.nn.functional.relu(heatmap)
+    heatmap = heatmap.detach().cpu().numpy()
+
+    if heatmap.max() > 0:
+        heatmap = heatmap / heatmap.max()
+
+    # Upsample heatmap to image resolution using overcomplete's cv2-based interpolation
+    width, height = get_image_dimensions(img_pil)
+    heatmap_up    = interpolate_cv2(heatmap, (width, height))
+
+    if return_only:
+        return img_pil, heatmap
+
+    # Plot: original | overlay
+    plt.figure(figsize=(8, 4))
+    plt.subplot(1, 2, 1)
+    show(img_pil)
+    plt.title("Original")
+
+    plt.subplot(1, 2, 2)
+    show(img_pil)
+    show(heatmap_up, cmap="jet", alpha=0.5)
+    plt.title(f"Concept {concept_id}: {cname}")
+
+    plt.tight_layout()
+    # plt.show()
+    return heatmap
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1635,7 +2762,7 @@ def main():
     
 
     # ── SAE representation extraction (optional) ──────────────────────────────
-    from sae import SAE  # type: ignore[import]
+    from msae.sae import SAE
 
     
     # resolve ft feature file and embed dim from previously saved .npy in run_dir
@@ -1656,9 +2783,11 @@ def main():
         _act_base, _sparse_w = _act.split("_", 1)
         activation_str = f"{_act_base}_{str(float(f'0.{_sparse_w}')).split('.')[1]}"
     elif args.model in ["MSAE_UW", "MSAE_RW"]:
-        model = args.model.replace("MSAE_", "")
-        activation_str = "TopK_64" + "_" + model
-    
+        if args.activation is None:
+            model = args.model.replace("MSAE_", "")
+            activation_str = "TopK_64" + "_" + model
+        else:
+            activation_str = args.activation 
     else:
         activation_str = _act
     
@@ -1825,9 +2954,11 @@ def main():
         npy_files = sorted(glob.glob(os.path.join(vocab_path, "*.npy")))
         if not npy_files:
             raise FileNotFoundError(f"No .npy files found in directory {vocab_path}")
-        vocab_path_to_load = npy_files[0]
+        
+        vocab_path_to_load = max(npy_files, key=os.path.getmtime)
     else:
         vocab_path_to_load = vocab_path
+    #### Update to find most related one
     concept_match_scores = np.load(vocab_path_to_load)
     print("concept_match_scores.shape:", concept_match_scores.shape)
     
@@ -1900,7 +3031,29 @@ def main():
 
 
     ### Experiment set 4: find concepts that are highly prevalent among the misclassified images and have low prevalence among the fine-tune set images, as potential spurious correlates learned by the model
-    candidate_concepts, top_concepts, concept_source_group, concept_mis_prevalence = find_spurious_concepts(
+    # candidate_concepts, concept_source_group, concept_mis_prevalence = find_spurious_concepts(
+    #     te_results=te_results,
+    #     ft_results=ft_results,
+    #     test_ds=test_ds,
+    #     ft_ds=ft_ds,
+    #     concept_match_scores=concept_match_scores,
+    #     vocab_names=vocab_names,
+    #     sae_dir=sae_dir,
+    #     clip_ft=clip_ft,
+    # )
+### Experiment set 5: Ablation of candidate spurious concepts — zero out the corresponding SAE latents, reconstruct CLIP features, re-classify, and report accuracy deltas for each group along with example corrected/worsened images.
+    # candidate_concepts, concept_source_group, concept_mis_prevalence = find_spurious_concepts_binary(
+    #     te_results=te_results,
+    #     ft_results=ft_results,
+    #     test_ds=test_ds,
+    #     ft_ds=ft_ds,
+    #     concept_match_scores=concept_match_scores,
+    #     vocab_names=vocab_names,
+    #     sae_dir=sae_dir,
+    #     clip_ft=clip_ft,
+    # )
+
+    candidate_concepts, concept_source_group, concept_mis_prevalence = find_and_show_spurious_concepts_binary(
         te_results=te_results,
         ft_results=ft_results,
         test_ds=test_ds,
@@ -1909,7 +3062,12 @@ def main():
         vocab_names=vocab_names,
         sae_dir=sae_dir,
         clip_ft=clip_ft,
+        sae_model=sae_model, device=device,
     )
+
+    
+    #     plt.show()
+
 
     if len(candidate_concepts) > 0:
         ablate_spurious_concepts(
@@ -1921,7 +3079,7 @@ def main():
             sae_dir=sae_dir,
             vocab_names=vocab_names,
             concept_match_scores=concept_match_scores,
-            ablation_hook=make_sae_ablation_hook(sae_model, candidate_concepts, device), # make_projection_ablation_hook,     ###make_sae_ablation_hook(sae_model, candidate_concepts, device),
+            ablation_hook=make_sae_ablation_hook(sae_model, candidate_concepts, device),
             concept_source_group=concept_source_group,
             concept_mis_prevalence=concept_mis_prevalence,
             concept_extractor_name="find_spurious_concepts",

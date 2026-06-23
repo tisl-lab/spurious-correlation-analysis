@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 
 from sae import load_model
-from utils import SAEDataset, set_seed, get_device
+from .utils import SAEDataset, set_seed, get_device
 from metrics import (
     explained_variance_full,
     normalized_mean_absolute_error,

@@ -20,7 +20,7 @@ from torch.utils.data import Dataset
 from torchvision.datasets import CelebA
 from clip_zero_shot import CLIPZeroShot  # noqa: E402
 
-from utils import get_device, set_seed
+from .utils import get_device, set_seed
 
 """
 CLIP Embedding Extraction Utility

@@ -8,7 +8,7 @@ from dataclasses import asdict
 import os
 
 from metrics import calculate_similarity_metrics, identify_dead_neurons, orthogonal_decoder, cknna, explained_variance
-from utils import SAEDataset, set_seed, get_device, geometric_median, calculate_vector_mean, LinearDecayLR, CosineWarmupScheduler
+from .utils import SAEDataset, set_seed, get_device, geometric_median, calculate_vector_mean, LinearDecayLR, CosineWarmupScheduler
 from config import get_config
 from sae import Autoencoder, MatryoshkaAutoencoder
 from loss import SAELoss

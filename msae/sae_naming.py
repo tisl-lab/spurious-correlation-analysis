@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 
 from sae import SAE
-from utils import SAEDataset, set_seed
+from .utils import SAEDataset, set_seed
 
 """
 Sparse Autoencoder Interpreter

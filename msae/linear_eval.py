@@ -6,7 +6,7 @@ from tqdm import tqdm
 from sklearn.metrics import f1_score
 
 from sae import load_model
-from utils import SAEDataset, set_seed, get_device
+from .utils import SAEDataset, set_seed, get_device
 
 """
 Linear Probe Evaluation for Sparse Autoencoders

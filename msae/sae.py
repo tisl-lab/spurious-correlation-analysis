@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from utils import normalize_data, JumpReLUFunction, StepFunction
+from .utils import normalize_data, JumpReLUFunction, StepFunction
 
 """
 Sparse Autoencoder (SAE) Implementation

@@ -198,7 +198,7 @@ def default_msae_rw_model() -> ModelConfig:
     return ModelConfig(
         use_matryoshka=True,
         activation="TopKReLU",
-        nesting_list=64,
+        nesting_list=256,
         relative_importance="RW",
     )
 
