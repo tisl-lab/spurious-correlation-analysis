@@ -37,6 +37,7 @@ from collections import defaultdict
 from datetime import datetime
 
 import numpy as np
+import torch
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -61,8 +62,8 @@ def _gid(label: int, place: int) -> int:
 # ── CLIP prompts ───────────────────────────────────────────────────────────────
 
 _WB_SHAPE_PROMPTS = {
-    0: "a photo of a landbird",
-    1: "a photo of a waterbird",
+    0: "a photo of a Landbird",
+    1: "a photo of a Waterbird",
 }
 _WB_BG_PROMPTS = {
     0: "a photo of a bird in a land environment",
@@ -99,14 +100,16 @@ class WaterbirdsDataset:
     clip_preprocess = None
 
     def __init__(self, root: str, split=None, group_filter=None,
-                 max_samples=None, seed=42):
+                 max_samples=None, seed=42, balanced=False):
         """
         Args:
             root         : directory containing metadata.csv and image files
             split        : None (all splits), int, or list[int] — 0=train,1=val,2=test
             group_filter : None (all groups) or set/list of group_ids to keep
-            max_samples  : cap total samples for quick testing
+            max_samples  : cap samples per class (or per group when balanced=True)
             seed         : RNG seed for subsampling
+            balanced     : subsample max_samples per group (class × background)
+                           instead of per class, yielding a group-balanced subset
         """
         import pandas as pd
 
@@ -127,8 +130,9 @@ class WaterbirdsDataset:
 
         rng = np.random.default_rng(seed)
         if max_samples is not None:
+            group_cols = ["y", "place"] if balanced else ["y"]
             parts = []
-            for _, grp in df.groupby("y"):
+            for _, grp in df.groupby(group_cols):
                 if len(grp) > max_samples:
                     chosen = rng.choice(len(grp), size=max_samples, replace=False)
                     parts.append(grp.iloc[sorted(chosen)])
@@ -166,23 +170,65 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="CLIP Zero-Shot + Fine-Tuning on Waterbirds spurious correlation benchmark"
     )
-    parser.add_argument("--clip_model",  type=str, default="ViT-B/32",
+    parser.add_argument("--clip_model",  type=str, default="ViT-L/14",
                         choices=["ViT-B/32", "ViT-B/16", "ViT-L/14", "RN50", "RN101"])
-    parser.add_argument("--data_dir",    type=str, default="./data/waterbirds")
+    parser.add_argument("--data_dir",    type=str, default=None,
+                        help="Waterbirds dataset root (contains metadata.csv). "
+                             "Defaults to ./data/waterbirds (or $HOME/data/waterbirds "
+                             "under SLURM) when not set; pass explicitly to override, "
+                             "e.g. on a server with a different data layout.")
     parser.add_argument("--output_dir",  type=str, default="./results/waterbirds")
     parser.add_argument("--batch_size",  type=int, default=64)
     parser.add_argument("--seed",        type=int, default=42)
     parser.add_argument("--ft_epochs",   type=int, default=3)
     parser.add_argument("--ft_lr",       type=float, default=1e-5)
-    parser.add_argument("--max_samples", type=int, default=400,
+    parser.add_argument("--max_samples", type=int, default=100,
                         help="Cap images loaded per split for quick testing")
-    parser.add_argument("--biased_ft",   action="store_true", default=True,
+    parser.add_argument("--biased_ft",   action="store_true", default=False,
                         help="Fine-tune only on spurious-saligned training examples "
                              "(groups 0 and 3); exacerbates the spurious correlation")
-    
+    parser.add_argument("--clip_weights_dir", type=str, default=None,
+                        help="Path to offline CLIP weights saved by "
+                             "CLIPZeroShot.download_and_save() / download_hf_models.py. "
+                             "Use on servers without internet access.")
+    parser.add_argument("--balanced_ft",   type=bool,  default=True,
+                        help="Fine-tune on a group-balanced subset of training examples; "
+                             "mutually exclusive with --biased_ft")
+    parser.add_argument("--bias_balanced_ft", type=str, default=None,
+                        help="Path to a saved BALANCED model.pt. When set, loads that "
+                             "already-balanced model and fine-tunes it again on biased "
+                             "(spurious-aligned) data — a two-stage BALANCED→BIASED run. "
+                             "Implies biased fine-tuning starting from the given checkpoint.")
 
+    args = parser.parse_args()
 
-    return parser.parse_args()
+    # Two-stage BALANCED→BIASED: fine-tune the biased subset starting from the given
+    # balanced checkpoint. Balancing already happened in stage 1, so it's biased-only now.
+    if args.bias_balanced_ft:
+        args.biased_ft = True
+        args.balanced_ft = False
+
+    if args.balanced_ft and args.biased_ft:
+        parser.error("--balanced_ft and --biased_ft are mutually exclusive; enable only one")
+
+    # Regular default path, applied only when --data_dir wasn't explicitly set
+    # (kept as a separate fallback, not the argparse default itself, so an
+    # explicit --data_dir is distinguishable from "unset" below and on the CLI).
+    if args.data_dir is None:
+        args.data_dir = "./data/waterbirds"
+
+    # On Compute Canada, SLURM_JOB_ID is always set — redirect paths to $HOME
+    # only when the user has not explicitly overridden them.
+    if "SLURM_JOB_ID" in os.environ:
+        _home = os.path.expanduser("~")
+        if args.data_dir == "./data/waterbirds":
+            args.data_dir = os.path.join(_home, "data", "waterbirds")
+        if args.output_dir == "./results/waterbirds":
+            args.output_dir = os.path.join(_home, "results", "waterbirds")
+        if args.clip_weights_dir is None:
+            args.clip_weights_dir = os.path.join(_home, "hf_models")
+
+    return args
 
 
 # ── Dependency check ───────────────────────────────────────────────────────────
@@ -289,7 +335,12 @@ def visualize_waterbirds(zs_stats, ft_stats, output_dir, args):
     # aligned = green, counter-spurious = red
     GROUP_COLORS = ["#59a14f", "#e15759", "#e15759", "#59a14f"]
 
-    ft_label = "Biased FT on " + str(args.max_samples) + " images per group"  if args.biased_ft else "Fine-Tuned on " + str(args.max_samples) + " images per group"
+    if args.biased_ft:
+        ft_label = "Biased FT on " + str(args.max_samples) + " images per aligned group"
+    elif args.balanced_ft:
+        ft_label = "Balanced FT on " + str(args.max_samples) + " images per group for all 4 groups"
+    else:
+        ft_label = "Fine-Tuned on " + str(args.max_samples) + " images per group"
 
     zs_grp = {g["group_id"]: g for g in zs_stats["per_group"]}
     ft_grp = {g["group_id"]: g for g in ft_stats["per_group"]}
@@ -581,6 +632,7 @@ def main():
     print(f"  Data dir   : {args.data_dir}")
     print(f"  FT epochs  : {args.ft_epochs}   lr: {args.ft_lr}")
     print(f"  Biased FT  : {args.biased_ft}")
+    print(f"  Balanced FT: {args.balanced_ft}")
     print(f"  Output     : {args.output_dir}")
     print("═" * 65 + "\n")
 
@@ -588,8 +640,12 @@ def main():
 
     # ── Load splits ───────────────────────────────────────────────────────────
     print("Loading Waterbirds dataset...")
-    train_ds = WaterbirdsDataset(args.data_dir, split=0,
+    if not args.balanced_ft :
+        train_ds = WaterbirdsDataset(args.data_dir, split=0,
                                  max_samples=args.max_samples, seed=args.seed)
+    else: 
+        train_ds = WaterbirdsDataset(args.data_dir, split=0,
+                                 seed=args.seed, balanced=True)
     test_ds  = WaterbirdsDataset(args.data_dir, split=2,
                                  max_samples=None, seed=args.seed)
 
@@ -606,6 +662,12 @@ def main():
                                   group_filter=ALIGNED_GROUPS,
                                   max_samples=args.max_samples, seed=args.seed)
         print(f"\n  Biased FT: {len(ft_ds)} images — spurious-aligned groups only")
+    elif args.balanced_ft:
+        ft_ds = WaterbirdsDataset(args.data_dir, split=0,
+                                  group_filter=[0, 1, 2, 3],
+                                  max_samples=args.max_samples, seed=args.seed,
+                                  balanced=True)
+        print(f"\n  Balanced FT: {len(ft_ds)} images — group-balanced subset")
     else:
         ft_ds = train_ds
         print(f"\n  Full FT  : {len(ft_ds)} training images")
@@ -614,25 +676,48 @@ def main():
         print("  ✗ Fine-tune dataset is empty. Check --data_dir or --biased_ft.")
         sys.exit(1)
 
-    # ── Zero-Shot ─────────────────────────────────────────────────────────────
+    # ── Baseline (Zero-Shot, or the loaded balanced model for a two-stage run) ─
     from clip_zero_shot import CLIPZeroShot
 
     print("\n" + "─" * 65)
-    print("  ZERO-SHOT EVALUATION")
-    print("─" * 65)
-    clip_zs = CLIPZeroShot(model_name=args.clip_model, device=device)
+    if args.bias_balanced_ft:
+        print("  BASELINE EVALUATION (balanced model, before biased fine-tuning)")
+        print("─" * 65)
+        print(f"  Loading balanced model: {args.bias_balanced_ft}")
+        # clip_ft starts from the balanced checkpoint; fine_tune() will continue it.
+        clip_ft = CLIPZeroShot.load_model(args.bias_balanced_ft, device=device)
+        baseline_label = "Balanced (pre-biased) / Test"
+        baseline_model = clip_ft
+    else:
+        print("  ZERO-SHOT EVALUATION")
+        print("─" * 65)
+        clip_ft = None
+        baseline_label = "Zero-Shot / Test"
+        baseline_model = CLIPZeroShot(model_name=args.clip_model, device=device,
+                                      offline_weights_dir=args.clip_weights_dir)
     t0 = time.time()
-    res_zs   = clip_zs.run(dataset=test_ds, prompt_mode="shape",
-                           dataset_name="waterbirds", batch_size=args.batch_size)
-    zs_stats = evaluate_waterbirds(res_zs, label="Zero-Shot / Test")
+    res_zs   = baseline_model.run(dataset=test_ds, prompt_mode="shape",
+                                  dataset_name="waterbirds", batch_size=args.batch_size)
+    zs_stats = evaluate_waterbirds(res_zs, label=baseline_label)
     print(f"  Done in {time.time() - t0:.1f}s")
 
     # ── Fine-Tuning ───────────────────────────────────────────────────────────
-    ft_tag = "BIASED" if args.biased_ft else "FULL"
+    if args.bias_balanced_ft:
+        ft_tag = "BIASEDfromBALANCED"
+    elif args.biased_ft:
+        ft_tag = "BIASED"
+    elif args.balanced_ft:
+        ft_tag = "BALANCED"
+    else:
+        ft_tag = "FULL"
     print("\n" + "─" * 65)
     print(f"  FINE-TUNING ({ft_tag}, {args.ft_epochs} epoch(s), lr={args.ft_lr})")
     print("─" * 65)
-    clip_ft = CLIPZeroShot(model_name=args.clip_model, device=device)
+    # For a two-stage run clip_ft is already the loaded balanced model; otherwise
+    # start fine-tuning from base CLIP.
+    if clip_ft is None:
+        clip_ft = CLIPZeroShot(model_name=args.clip_model, device=device,
+                               offline_weights_dir=args.clip_weights_dir)
     clip_ft.fine_tune(
         dataset=ft_ds,
         dataset_name="waterbirds",
@@ -656,6 +741,7 @@ def main():
         "ft_lr":       args.ft_lr,
         "seed":        args.seed,
         "biased_ft":   args.biased_ft,
+        "bias_balanced_ft": args.bias_balanced_ft,   # source balanced checkpoint, if two-stage
         "data_dir":    os.path.abspath(args.data_dir),
         "run_dir":     os.path.abspath(run_dir),
     }

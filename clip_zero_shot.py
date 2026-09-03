@@ -120,8 +120,8 @@ SPAWRIOUS224_SHAPE_PROMPTS = {
 }
 
 WATERBIRDS_SHAPE_PROMPTS = {
-    0: "a photo of a landbird",
-    1: "a photo of a waterbird",
+    0: ["a photo of a landbird", "a photo of a Landbird"],
+    1: ["a photo of a waterbird", "a photo of a Waterbird"],
 }
 
 # Spawrious-224: background-based prompts (spurious feature)
@@ -190,21 +190,51 @@ class CLIPZeroShot:
         results = model.run(dataset, prompt_mode="shape", dataset_name="mnist")
     """
 
-    def __init__(self, model_name: str = "ViT-B/32", device: str = None):
+    def __init__(self, model_name: str = "ViT-B/32", device: str = None,
+                 offline_weights_dir: str = None):
         """
         Args:
-            model_name : CLIP model variant. ViT-B/32 is the standard baseline.
-                         Other options: "RN50", "RN101", "ViT-L/14"
-            device     : "cuda", "cpu", or None (auto-detect)
+            model_name          : CLIP model variant. ViT-B/32 is the standard baseline.
+                                  Other options: "RN50", "RN101", "ViT-L/14"
+            device              : "cuda", "cpu", or None (auto-detect)
+            offline_weights_dir : path to a directory saved by download_and_save().
+                                  If given, loads weights from disk instead of downloading.
         """
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = (
+                "cuda" if torch.cuda.is_available()
+                else "mps" if torch.backends.mps.is_available()
+                else "cpu"
+            )
 
         self.device = device
         self.model_name = model_name
 
-        print(f"Loading CLIP {model_name} on {device}...")
-        self.model, self.preprocess = clip.load(model_name, device=device)
+        if offline_weights_dir:
+            import os, pickle
+            model_tag       = model_name.replace("/", "~")
+            weights_path    = os.path.join(offline_weights_dir, model_tag, "weights.pt")
+            preprocess_path = os.path.join(offline_weights_dir, model_tag, "preprocess.pkl")
+            if not os.path.isfile(weights_path):
+                raise FileNotFoundError(
+                    f"Offline weights not found at {weights_path}. "
+                    f"Run CLIPZeroShot.download_and_save('{model_name}', '{offline_weights_dir}') "
+                    f"on a machine with internet access first."
+                )
+            print(f"Loading CLIP {model_name} from disk ({offline_weights_dir}) ...")
+            payload = torch.load(weights_path, map_location="cpu", weights_only=False)
+            # Initialise architecture via online load only to get the skeleton,
+            # then immediately overwrite with the saved weights.
+            self.model, self.preprocess = clip.load(model_name, device="cpu")
+            self.model.load_state_dict(payload["state_dict"])
+            self.model = self.model.to(device)
+            if os.path.isfile(preprocess_path):
+                with open(preprocess_path, "rb") as f:
+                    self.preprocess = pickle.load(f)
+        else:
+            print(f"Loading CLIP {model_name} on {device}...")
+            self.model, self.preprocess = clip.load(model_name, device=device)
+
         self.model.eval()
         print(f"CLIP loaded. Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
@@ -225,6 +255,20 @@ class CLIPZeroShot:
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         return text_features  # (n_classes, D)
+
+    def _encode_text_prompts_multi(self, prompts: dict) -> torch.Tensor:
+        """Encode {class_id: [prompt, ...]} by averaging normalized embeddings per class."""
+        class_features = []
+        with torch.no_grad():
+            for i in range(len(prompts)):
+                texts = prompts[i]
+                tokens = clip.tokenize(texts).to(self.device)
+                feats = self.model.encode_text(tokens)           # (n_prompts, D)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                avg   = feats.mean(dim=0)
+                avg   = avg / avg.norm()
+                class_features.append(avg)
+        return torch.stack(class_features)  # (n_classes, D)
 
     def fine_tune(
         self,
@@ -392,8 +436,14 @@ class CLIPZeroShot:
         # Cast to float32 to ensure consistency with image features.
         # After fine_tune(), the visual encoder is float32 while the text encoder
         # may still be float16; mixing dtypes crashes MPS matrix multiply.
-        text_feats_shape = self.encode_text_prompts(shape_prompts).float() if run_shape else None
-        text_feats_color = self.encode_text_prompts(color_prompts).float() if run_color else None
+        def _encode(p):
+            # Use multi-prompt averaging when prompt values are lists (e.g. waterbirds shape).
+            if isinstance(next(iter(p.values())), list):
+                return self._encode_text_prompts_multi(p).float()
+            return self.encode_text_prompts(p).float()
+
+        text_feats_shape = _encode(shape_prompts) if run_shape else None
+        text_feats_color = _encode(color_prompts) if run_color else None
 
         # Run inference
         all_preds_shape = [] if run_shape else None
@@ -470,6 +520,96 @@ class CLIPZeroShot:
         instance.model.eval()
         if "metadata" in payload:
             print(f"  Loaded metadata: {payload['metadata']}")
+        return instance
+
+    @classmethod
+    def download_and_save(cls, model_name: str = "ViT-B/32", save_dir: str = "./clip_weights"):
+        """
+        Download base CLIP weights and save them to disk for offline use.
+
+        On a machine with internet access, run this once to cache the weights.
+        On an offline server, point --hf_model_dir (or load directly) to save_dir.
+
+        Saves two files:
+            <save_dir>/<model_tag>/weights.pt     — model state_dict + model_name
+            <save_dir>/<model_tag>/preprocess.pkl — torchvision preprocess transform
+
+        Args:
+            model_name: CLIP architecture, e.g. "ViT-B/32", "ViT-B/16", "ViT-L/14"
+            save_dir:   root directory to save into
+
+        Returns:
+            save_path (str): path to the saved weights.pt file
+
+        Example:
+            CLIPZeroShot.download_and_save("ViT-B/32", save_dir="./clip_weights")
+            # later, on an offline server:
+            clip = CLIPZeroShot.load_offline("ViT-B/32", weights_dir="./clip_weights")
+        """
+        import os, pickle
+        model_tag  = model_name.replace("/", "~")
+        model_dir  = os.path.join(save_dir, model_tag)
+        os.makedirs(model_dir, exist_ok=True)
+
+        weights_path    = os.path.join(model_dir, "weights.pt")
+        preprocess_path = os.path.join(model_dir, "preprocess.pkl")
+
+        print(f"Downloading CLIP {model_name} …")
+        instance = cls(model_name=model_name)
+
+        torch.save({
+            "model_name": instance.model_name,
+            "state_dict": instance.model.state_dict(),
+        }, weights_path)
+
+        with open(preprocess_path, "wb") as f:
+            pickle.dump(instance.preprocess, f)
+
+        print(f"  Weights    → {weights_path}")
+        print(f"  Preprocess → {preprocess_path}")
+        return weights_path
+
+    @classmethod
+    def load_offline(cls, model_name: str = "ViT-B/32",
+                     weights_dir: str = "./clip_weights", device: str = None):
+        """
+        Load a CLIP model from a directory saved by download_and_save() — no internet needed.
+
+        Args:
+            model_name:  CLIP architecture string, e.g. "ViT-B/32"
+            weights_dir: root directory passed to download_and_save()
+            device:      torch device string or None (auto-detect)
+
+        Returns:
+            CLIPZeroShot instance with base weights loaded
+
+        Example:
+            clip = CLIPZeroShot.load_offline("ViT-B/32", weights_dir="./clip_weights")
+        """
+        import os, pickle
+        model_tag  = model_name.replace("/", "~")
+        model_dir  = os.path.join(weights_dir, model_tag)
+
+        weights_path    = os.path.join(model_dir, "weights.pt")
+        preprocess_path = os.path.join(model_dir, "preprocess.pkl")
+
+        if not os.path.isfile(weights_path):
+            raise FileNotFoundError(
+                f"Weights not found at {weights_path}. "
+                f"Run CLIPZeroShot.download_and_save('{model_name}', '{weights_dir}') "
+                f"on a machine with internet access first."
+            )
+
+        payload  = torch.load(weights_path, map_location="cpu", weights_only=False)
+        instance = cls(model_name=payload["model_name"], device=device)
+        instance.model.load_state_dict(payload["state_dict"])
+        instance.model.eval()
+
+        if os.path.isfile(preprocess_path):
+            with open(preprocess_path, "rb") as f:
+                instance.preprocess = pickle.load(f)
+
+        print(f"  Loaded CLIP {model_name} from {model_dir}")
         return instance
 
     @staticmethod

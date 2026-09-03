@@ -8,7 +8,7 @@ from dataclasses import asdict
 import os
 
 from metrics import calculate_similarity_metrics, identify_dead_neurons, orthogonal_decoder, cknna, explained_variance
-from .utils import SAEDataset, set_seed, get_device, geometric_median, calculate_vector_mean, LinearDecayLR, CosineWarmupScheduler
+from utils import SAEDataset, set_seed, get_device, geometric_median, calculate_vector_mean, LinearDecayLR, CosineWarmupScheduler
 from config import get_config
 from sae import Autoencoder, MatryoshkaAutoencoder
 from loss import SAELoss
@@ -47,12 +47,17 @@ def parse_args() -> argparse.Namespace:
             - expansion_factor: Ratio of latent dimensions to input dimensions
     """
     parser = argparse.ArgumentParser(description="Train Sparse Autoencoder (SAE) models")
-    parser.add_argument("-dt", "--dataset_train", type=str, default="results/waterbirds/embeddings/waterbirds_ViT-B~32_fttrain_image_762_512.npy", 
-                       help="Path to training dataset file (.npy)")
-    parser.add_argument("-ds", "--dataset_test", type=str, default="results/waterbirds/embeddings/waterbirds_ViT-B~32_ft400_test_image_5794_512.npy",
-                       help="Path to testing/validation dataset file (.npy)")
-    parser.add_argument("-dm", "--dataset_second_modality", type=str, default="results/waterbirds/embeddings/waterbirds_ViT-B~32_ft400_test_text_5794_512.npy",
-                       help="Path to second modality dataset file (.npy)")
+    parser.add_argument("-dt", "--dataset_train", type=str,
+                       default="results/waterbirds/embeddings/waterbirds_ViT-B~32_zs_train_image_4795_512.npy",
+                       help="Path to training dataset file (.npy). "
+                            "Zero-shot: waterbirds_ViT-B~32_zs_train_image_*.npy  "
+                            "Fine-tuned: waterbirds_ViT-B~32_ft<N>_train_image_*.npy")
+    parser.add_argument("-ds", "--dataset_test", type=str,
+                       default="results/waterbirds/embeddings/waterbirds_ViT-B~32_zs_test_image_5794_512.npy",
+                       help="Path to testing/validation dataset file (.npy).")
+    parser.add_argument("-dm", "--dataset_second_modality", type=str, default=None,
+                       help="Path to second modality dataset file (.npy). "
+                            "Optional — omit for image-only SAE training.")
     parser.add_argument("-m", "--model", type=str, default="MSAE_UW",
                        choices=["ReLUSAE", "TopKSAE", "BatchTopKSAE", "MSAE_UW", "MSAE_RW"], 
                        help="Model architecture to train")
@@ -60,8 +65,13 @@ def parse_args() -> argparse.Namespace:
                        help="Activation function (e.g., 'ReLU_003', 'TopKReLU_64')")
     parser.add_argument("-e", "--epochs", type=int, default=20, 
                        help="Number of training epochs")
-    parser.add_argument("-ef", "--expansion_factor", type=float, default=8.0, 
+    parser.add_argument("-ef", "--expansion_factor", type=float, default=21.0,
                        help="Ratio of latent dimensions to input dimensions")
+    parser.add_argument("--nesting_start", type=int, default=None,
+                       help="Override the Matryoshka nesting start value for MSAE_UW/MSAE_RW "
+                            "(e.g. 64 for a TopKReLU_64-based nesting list). Both presets "
+                            "hardcode nesting_start=256 otherwise, so pass this explicitly to "
+                            "train a smaller-k variant like TopKReLU_64.")
     return parser.parse_args()
 
 
@@ -212,7 +222,11 @@ def main(args):
     # Override activation if specified in arguments
     if args.activation:
         cfg.model.activation = args.activation
-    
+
+    # Override the Matryoshka nesting start (MSAE_UW/MSAE_RW hardcode 256 by default)
+    if args.nesting_start is not None:
+        cfg.model.nesting_list = args.nesting_start
+
     # Configure Matryoshka SAE parameters if applicable
     if cfg.model.use_matryoshka:
         # Max nesting list

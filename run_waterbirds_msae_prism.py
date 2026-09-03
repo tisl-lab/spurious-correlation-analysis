@@ -37,6 +37,9 @@ from collections import defaultdict
 from datetime import datetime
 
 import numpy as np
+import torch
+from wilds.datasets.wilds_dataset import WILDSDataset
+from wilds.common.grouper import CombinatorialGrouper
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -61,8 +64,8 @@ def _gid(label: int, place: int) -> int:
 # ── CLIP prompts ───────────────────────────────────────────────────────────────
 
 _WB_SHAPE_PROMPTS = {
-    0: "a photo of a landbird",
-    1: "a photo of a waterbird",
+    0: "a photo of a Landbird",
+    1: "a photo of a Waterbird",
 }
 _WB_BG_PROMPTS = {
     0: "a photo of a bird in a land environment",
@@ -81,32 +84,42 @@ def _register_prompts():
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 
-class WaterbirdsDataset:
+class WaterbirdsDataset(WILDSDataset):
     """
-    Waterbirds dataset wrapper compatible with CLIPZeroShot.run() and fine_tune().
+    Waterbirds dataset inheriting from WILDSDataset — matches PRISM/data/Waterbird.py.
 
-    Each sample returns:
-        image      (PIL.Image or tensor) — bird image
-        label      (int)                 — 0=landbird, 1=waterbird
-        bg_name    (str)                 — "land" or "water"
-        group_id   (int)                 — label * 2 + place
+    Extensions over PRISM:
+      - split / group_filter / max_samples filtering at construction time
+      - train_group_sizes computed dynamically from metadata.csv (not hardcoded)
+      - clip_preprocess injection for CLIPZeroShot compatibility
+      - __getitem__ returns (img, label, bg_name, gid) for prism_classify
 
-    clip_preprocess is injected by CLIPZeroShot automatically.
-
-    Split codes in metadata.csv: 0=train, 1=val, 2=test.
+    Split codes: 0=train, 1=val, 2=test.
     """
+
+    # Required by WILDSDataset (matches PRISM exactly)
+    _dataset_name  = "waterbirds"
+    _versions_dict = {
+        "1.0": {
+            "download_url":    "https://worksheets.codalab.org/rest/bundles/"
+                               "0x505056d5cdea4e4eaa0e242cbfe2daa4/contents/blob/",
+            "compressed_size": None,
+        }
+    }
+    _original_resolution = (224, 224)
 
     clip_preprocess = None
 
     def __init__(self, root: str, split=None, group_filter=None,
-                 max_samples=None, seed=42):
+                 max_samples=None, seed=42, balanced=False):
         """
         Args:
             root         : directory containing metadata.csv and image files
-            split        : None (all splits), int, or list[int] — 0=train,1=val,2=test
+            split        : None (all), int, or list[int] — 0=train, 1=val, 2=test
             group_filter : None (all groups) or set/list of group_ids to keep
-            max_samples  : cap total samples for quick testing
-            seed         : RNG seed for subsampling
+            max_samples  : cap images per class (for quick testing / biased subsets)
+            seed         : RNG seed used when max_samples subsamples
+            balanced     : whether to balance the subset across groups
         """
         import pandas as pd
 
@@ -115,12 +128,20 @@ class WaterbirdsDataset:
             raise FileNotFoundError(
                 f"Waterbirds metadata not found: {meta_path}\n"
                 f"Download from:\n"
-                f"  https://nlp.stanford.edu/data/dro/waterbird_complete95_forest2water2.tar.gz\n"
-                f"and extract it, then pass the directory as --data_dir."
+                f"  https://nlp.stanford.edu/data/dro/waterbird_complete95_forest2water2.tar.gz"
             )
 
-        df = pd.read_csv(meta_path)
+        full_df = pd.read_csv(meta_path)
 
+        # Training group sizes from the FULL unfiltered train split.
+        # adj_acc_avg must be weighted by the real training distribution,
+        # regardless of any subsampling applied to this dataset object.
+        _tr  = full_df[full_df["split"] == 0]
+        _cnt = (_tr["y"] * 2 + _tr["place"]).value_counts().to_dict()
+        self.train_group_sizes = {gid: _cnt.get(gid, 0) for gid in range(4)}
+
+        # ── Apply filters ─────────────────────────────────────────────────────
+        df = full_df.copy()
         if split is not None:
             splits = [split] if isinstance(split, int) else list(split)
             df = df[df["split"].isin(splits)].reset_index(drop=True)
@@ -136,28 +157,132 @@ class WaterbirdsDataset:
                     parts.append(grp)
             df = pd.concat(parts).sort_index().reset_index(drop=True)
 
-        self.root = root
-        self.samples = []
-        for _, row in df.iterrows():
-            label = int(row["y"])
-            place = int(row["place"])
-            gid   = _gid(label, place)
-            if group_filter is not None and gid not in set(group_filter):
-                continue
-            
-            path = os.path.join(root, row["img_filename"])
-            self.samples.append((path, label, BG_NAMES[place], gid))
+        if group_filter is not None:
+            gids = df["y"] * 2 + df["place"]
+            df = df[gids.isin(set(group_filter))].reset_index(drop=True)
+
+        # ── WILDSDataset required attributes (mirrors PRISM/data/Waterbird.py) ─
+        # We set these manually and skip super().__init__() because WILDS expects
+        # data at root_dir/waterbirds_v1.0/ but ours is directly at root/.
+        self._data_dir   = root
+        self._version    = "1.0"
+        self._split_scheme = "official"
+        self._split_dict   = {"train": 0, "val": 1, "test": 2}
+        self._split_names  = {"train": "Train", "val": "Validation", "test": "Test"}
+
+        self._y_array   = torch.LongTensor(df["y"].values.copy())
+        self._y_size    = 1
+        self._n_classes = 2
+
+        # metadata columns: [place/background, y] — matches PRISM exactly
+        self._metadata_array = torch.stack(
+            (torch.LongTensor(df["place"].values.copy()), self._y_array), dim=1
+        )
+        self._metadata_fields = ["background", "y"]
+        self._metadata_map    = {
+            "background": [" land", "water"],       # leading space matches PRISM
+            "y":          [" landbird", "waterbird"],
+        }
+
+        self._input_array = df["img_filename"].values   # relative paths (as in PRISM)
+        self._split_array = torch.LongTensor(df["split"].values.copy())
+
+        self._eval_grouper = CombinatorialGrouper(
+            dataset=self, groupby_fields=["background", "y"]
+        )
+
+        # ── Our interface ─────────────────────────────────────────────────────
+        self.root    = root
+        self.samples = [
+            (os.path.join(root, row["img_filename"]),
+             int(row["y"]),
+             BG_NAMES[int(row["place"])],
+             _gid(int(row["y"]), int(row["place"])))
+            for _, row in df.iterrows()
+        ]
+
+        # Numpy arrays for convenient indexing (y_array is already a WILDSDataset property)
+        self.place_array    = df["place"].values.astype(np.int64)
+        self.group_id_array = (df["y"].values * 2 + df["place"].values).astype(np.int64)
+
+    # ── WILDSDataset interface ────────────────────────────────────────────────
+
+    def get_input(self, idx):
+        """Return PIL Image for sample idx (WILDS-compatible)."""
+        from PIL import Image
+        return Image.open(
+            os.path.join(self._data_dir, self._input_array[idx])
+        ).convert("RGB")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        """Returns (img, label, bg_name, gid) — compatible with prism_classify."""
         from PIL import Image
         path, label, bg_name, gid = self.samples[idx]
         img = Image.open(path).convert("RGB")
         if self.clip_preprocess is not None:
             img = self.clip_preprocess(img)
         return img, label, bg_name, gid
+
+    def eval(self, y_pred, y_true, metadata, prediction_fn=None):
+        """WILDS-compatible eval with PRISM's training-weighted adj_acc_avg.
+
+        Computes per-group accuracy directly from predictions and metadata
+        (avoids torch_scatter dependency from standard_group_eval).
+        adj_acc_avg uses actual training group sizes from metadata.csv.
+        """
+        if prediction_fn is not None:
+            y_pred = prediction_fn(y_pred)
+
+        places = metadata[:, 0]   # background index (0=land, 1=water)
+        ys     = metadata[:, 1]   # class index     (0=landbird, 1=waterbird)
+
+        results     = {}
+        results_str = ""
+        total_w     = sum(self.train_group_sizes.values())
+        weighted    = 0.0
+
+        # Per-group accuracy: gid = y * 2 + place
+        for gid in range(4):
+            y_val, pl_val = gid // 2, gid % 2
+            mask = (ys == y_val) & (places == pl_val)
+            n    = int(mask.sum())
+            if n > 0:
+                acc = (y_pred[mask] == y_true[mask]).float().mean().item()
+                weighted += acc * self.train_group_sizes[gid]
+            else:
+                acc = float("nan")
+            gname = GROUP_NAMES[gid]
+            key   = f"acc_y:{CLASS_NAMES[y_val]}_background:{BG_NAMES[pl_val]}"
+            results[key] = acc
+            results_str += f"  {gname:<34} acc: {acc * 100:.1f}%  (n={n})\n"
+
+        overall = (y_pred == y_true).float().mean().item()
+        results["acc_avg"]     = overall
+        results["adj_acc_avg"] = weighted / total_w
+
+        results_str = (
+            f"Adjusted average acc: {results['adj_acc_avg']:.3f}\n"
+            + f"Overall acc: {overall:.3f}\n"
+            + results_str
+        )
+        return results, results_str
+
+    def adj_acc_avg(self, per_group_acc: dict) -> float:
+        """Training-weighted accuracy for use with evaluate_waterbirds().
+
+        Args:
+            per_group_acc: {group_id: accuracy_in_percent} for gid in {0,1,2,3}
+        Returns float in [0, 100].
+        """
+        total_w = sum(self.train_group_sizes.values())
+        return sum(
+            per_group_acc[gid] * w
+            for gid, w in self.train_group_sizes.items()
+            if gid in per_group_acc
+        ) / total_w
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -166,7 +291,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="CLIP Zero-Shot + Fine-Tuning on Waterbirds spurious correlation benchmark"
     )
-    parser.add_argument("--clip_model",  type=str, default="ViT-B/32",
+    parser.add_argument("--clip_model",  type=str, default="ViT-L/14",
                         choices=["ViT-B/32", "ViT-B/16", "ViT-L/14", "RN50", "RN101"])
     parser.add_argument("--data_dir",    type=str, default="./data/waterbirds")
     parser.add_argument("--output_dir",  type=str, default="./results/waterbirds")
@@ -174,17 +299,23 @@ def parse_args():
     parser.add_argument("--seed",        type=int, default=42)
     parser.add_argument("--ft_epochs",   type=int, default=3)
     parser.add_argument("--ft_lr",       type=float, default=1e-5)
-    parser.add_argument("--max_samples", type=int, default=10000,
+    parser.add_argument("--max_samples", type=int, default=100,
                         help="Cap images loaded per split for quick testing")
-    parser.add_argument("--biased_ft",   action="store_true", default=True,
+    parser.add_argument("--biased_ft",   type=bool,  default=True,
                         help="Fine-tune only on spurious-saligned training examples "
                              "(groups 0 and 3); exacerbates the spurious correlation")
     parser.add_argument("--clip_weights_dir", type=str, default=None,
                         help="Path to offline CLIP weights saved by "
                              "CLIPZeroShot.download_and_save() / download_hf_models.py. "
                              "Use on servers without internet access.")
+    parser.add_argument("--balanced_ft",   type=bool,  default=False,
+                        help="Fine-tune on a group-balanced subset of training examples; "
+                             "mutually exclusive with --biased_ft")
 
     args = parser.parse_args()
+
+    if args.balanced_ft and args.biased_ft:
+        parser.error("--balanced_ft and --biased_ft are mutually exclusive; enable only one")
 
     # On Compute Canada, SLURM_JOB_ID is always set — redirect paths to $HOME
     # only when the user has not explicitly overridden them.
@@ -222,7 +353,7 @@ def check_dependencies():
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
-def evaluate_waterbirds(results, label=""):
+def evaluate_waterbirds(results, label="", dataset=None):
     """Compute per-class, per-group, and overall accuracy from run() output."""
     preds  = results["predictions_shape"]
     trues  = results["true_labels"]
@@ -265,13 +396,28 @@ def evaluate_waterbirds(results, label=""):
 
     valid_accs = [g["acc"] for g in per_group if g["total"] > 0 and not np.isnan(g["acc"])]
     worst_acc  = min(valid_accs) if valid_accs else float("nan")
-    print(f"\n  Worst-group accuracy: {worst_acc:.2f}%")
+
+    # PRISM-style adj_acc_avg: weighted by actual training-set group frequencies.
+    # Sizes are read from the dataset object (computed from metadata.csv, not
+    # hardcoded) so they are correct regardless of subsampling.
+    # Falls back to equal weight when dataset is not provided.
+    train_sizes = dataset.train_group_sizes if dataset is not None \
+                  else {gid: 1 for gid in range(4)}
+    total_w = sum(train_sizes.values())
+    adj_acc = sum(
+        per_group[gid]["acc"] * train_sizes[gid]
+        for gid in range(4) if per_group[gid]["total"] > 0
+    ) / total_w
+
+    print(f"\n  Worst-group accuracy       : {worst_acc:.2f}%")
+    print(f"  Adj avg acc (train-weighted): {adj_acc:.2f}%")
 
     return {
         "overall":           {"acc": overall, "correct": n_correct, "total": n_total},
         "per_class":         per_class,
         "per_group":         per_group,
         "worst_group_acc":   worst_acc,
+        "adj_acc_avg":       adj_acc,
         "predictions_shape": preds,
         "true_labels":       trues,
         "group_ids":         groups,
@@ -304,7 +450,12 @@ def visualize_waterbirds(zs_stats, ft_stats, output_dir, args):
     # aligned = green, counter-spurious = red
     GROUP_COLORS = ["#59a14f", "#e15759", "#e15759", "#59a14f"]
 
-    ft_label = "Biased FT on " + str(args.max_samples) + " images per group"  if args.biased_ft else "Fine-Tuned on " + str(args.max_samples) + " images per group"
+    if args.biased_ft:
+        ft_label = "Biased FT on " + str(args.max_samples) + " images per aligned group"
+    elif args.balanced_ft:
+        ft_label = "Balanced FT on " + str(args.max_samples) + " images per group for all 4 groups"
+    else:
+        ft_label = "Fine-Tuned on " + str(args.max_samples) + " images per group"
 
     zs_grp = {g["group_id"]: g for g in zs_stats["per_group"]}
     ft_grp = {g["group_id"]: g for g in ft_stats["per_group"]}
@@ -469,6 +620,26 @@ def visualize_waterbirds(zs_stats, ft_stats, output_dir, args):
     return path
 
 
+# ── Dataset manifest ──────────────────────────────────────────────────────────
+
+def save_dataset_manifest(dataset, path, split_name):
+    import pandas as pd
+    rows = []
+    for img_path, label, bg_name, gid in dataset.samples:
+        rows.append({
+            "img_path":   img_path,
+            "label":      label,
+            "class":      ["landbird", "waterbird"][label],
+            "bg":         bg_name,
+            "group_id":   gid,
+            "group":      GROUP_NAMES[gid],
+            "aligned":    gid in ALIGNED_GROUPS,
+            "split":      split_name,
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f"  Saved: {path}  ({len(rows)} images)")
+
+
 # ── CSV output ─────────────────────────────────────────────────────────────────
 
 def save_results_csv(zs_stats, ft_stats, output_dir, sample_size):
@@ -576,7 +747,9 @@ def main():
     print(f"  Data dir   : {args.data_dir}")
     print(f"  FT epochs  : {args.ft_epochs}   lr: {args.ft_lr}")
     print(f"  Biased FT  : {args.biased_ft}")
+    print(f"  Balanced FT: {args.balanced_ft}")
     print(f"  Output     : {args.output_dir}")
+    
     print("═" * 65 + "\n")
 
     _register_prompts()
@@ -601,6 +774,12 @@ def main():
                                   group_filter=ALIGNED_GROUPS,
                                   max_samples=args.max_samples, seed=args.seed)
         print(f"\n  Biased FT: {len(ft_ds)} images — spurious-aligned groups only")
+    elif args.balanced_ft:
+        ft_ds = WaterbirdsDataset(args.data_dir, split=0,
+                                  group_filter=[0, 1, 2, 3],
+                                  max_samples=args.max_samples, seed=args.seed,
+                                  balanced=True)
+        print(f"\n  Balanced FT: {len(ft_ds)} images — group-balanced subset")
     else:
         ft_ds = train_ds
         print(f"\n  Full FT  : {len(ft_ds)} training images")
@@ -620,11 +799,16 @@ def main():
     t0 = time.time()
     res_zs   = clip_zs.run(dataset=test_ds, prompt_mode="shape",
                            dataset_name="waterbirds", batch_size=args.batch_size)
-    zs_stats = evaluate_waterbirds(res_zs, label="Zero-Shot / Test")
+    zs_stats = evaluate_waterbirds(res_zs, label="Zero-Shot / Test", dataset=test_ds)
     print(f"  Done in {time.time() - t0:.1f}s")
 
     # ── Fine-Tuning ───────────────────────────────────────────────────────────
-    ft_tag = "BIASED" if args.biased_ft else "FULL"
+    if args.biased_ft:
+        ft_tag = "BIASED"
+    elif args.balanced_ft:
+        ft_tag = "BALANCED"
+    else:
+        ft_tag = "FULL"
     print("\n" + "─" * 65)
     print(f"  FINE-TUNING ({ft_tag}, {args.ft_epochs} epoch(s), lr={args.ft_lr})")
     print("─" * 65)
@@ -638,13 +822,46 @@ def main():
         batch_size=args.batch_size,
     )
 
+    import json
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.output_dir, f"clip_ft_{ft_tag}_{args.max_samples}_{ts}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # ── model weights ─────────────────────────────────────────────────────────
+    model_path = os.path.join(run_dir, "model.pt")
+    metadata = {
+        "clip_model":  args.clip_model,
+        "ft_tag":      ft_tag,
+        "max_samples": args.max_samples,
+        "ft_epochs":   args.ft_epochs,
+        "ft_lr":       args.ft_lr,
+        "seed":        args.seed,
+        "biased_ft":   args.biased_ft,
+        "data_dir":    os.path.abspath(args.data_dir),
+        "run_dir":     os.path.abspath(run_dir),
+    }
+    clip_ft.save_model(model_path, metadata=metadata)
+
+    # ── run config ────────────────────────────────────────────────────────────
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"  Saved: {os.path.join(run_dir, 'config.json')}")
+
+    # ── dataset manifests ─────────────────────────────────────────────────────
+    print("\nSaving dataset manifests...")
+    save_dataset_manifest(train_ds, os.path.join(run_dir, "train_all_manifest.csv"),  "train")
+    save_dataset_manifest(ft_ds,    os.path.join(run_dir, "ft_train_manifest.csv"),   "ft_train")
+    save_dataset_manifest(test_ds,  os.path.join(run_dir, "test_manifest.csv"),       "test")
+
+    print(f"\n  Run folder: {os.path.abspath(run_dir)}")
+
     print("\n" + "─" * 65)
     print(f"  FINE-TUNED EVALUATION ({ft_tag})")
     print("─" * 65)
     t0 = time.time()
     res_ft   = clip_ft.run(dataset=test_ds, prompt_mode="shape",
-                           dataset_name="waterbirds")
-    ft_stats = evaluate_waterbirds(res_ft, label=f"{ft_tag} Fine-Tuned / Test")
+                           dataset_name="waterbirds", batch_size=args.batch_size)
+    ft_stats = evaluate_waterbirds(res_ft, label=f"{ft_tag} Fine-Tuned / Test", dataset=test_ds)
     print(f"  Done in {time.time() - t0:.1f}s")
 
     # ── Spurious correlation summary ──────────────────────────────────────────
@@ -669,6 +886,9 @@ def main():
 
     print(f"\nAll results in : {os.path.abspath(args.output_dir)}")
     print(f"Total runtime  : {time.time() - run_start:.1f}s\n")
+
+
+
 
 
 if __name__ == "__main__":

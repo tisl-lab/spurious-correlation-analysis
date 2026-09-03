@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 
 from sae import SAE
-from .utils import SAEDataset, set_seed
+from utils import SAEDataset, set_seed
 
 """
 Sparse Autoencoder Interpreter
@@ -158,8 +158,13 @@ def main(args):
     # Set random seed for reproducibility
     set_seed(args.seed)
     
-    # Load the trained SAE model
-    model = SAE(args.model)
+    # Load the trained SAE model. Forced onto CPU: SAE's internal torch.load()
+    # uses map_location='cuda' when available, which pulls its mean/scaling_factor
+    # buffers onto GPU while load_state_dict() leaves the decoder/pre_bias
+    # params on the model's default CPU device (load_state_dict preserves the
+    # destination tensor's device) -- a split-device model that crashes in
+    # postprocess(). This computation is small (vocab-sized), so CPU is fine.
+    model = SAE(args.model).to("cpu")
     logger.info("Model loaded")
     
     # Load the vocabulary dataset

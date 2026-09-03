@@ -71,6 +71,7 @@ class CLIPLRPWrapper:
         self,
         pixel_values: torch.Tensor,
         retain_attn_grad: bool = False,
+        embed_modifier=None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Forward through the vision encoder.
@@ -78,6 +79,11 @@ class CLIPLRPWrapper:
         Returns normalized image embeddings and a list of per-layer attention
         weight tensors [batch, heads, seq, seq].  When retain_attn_grad=True each
         tensor has retain_grad() called on it so .grad is populated after backward.
+
+        embed_modifier: optional callable (unnorm_embed) -> unnorm_embed applied
+        after visual_projection but before L2-normalization. Used to inject feature-space
+        ablations (e.g. concept direction removal) while keeping the operation inside
+        the autograd graph so attention gradients are correctly affected.
         """
         vision_out = self.model.vision_model(
             pixel_values=pixel_values,
@@ -90,6 +96,8 @@ class CLIPLRPWrapper:
                 attn.retain_grad()
 
         image_embeds = self.model.visual_projection(vision_out.pooler_output)
+        if embed_modifier is not None:
+            image_embeds = embed_modifier(image_embeds)
         image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
         return image_embeds, attentions
 
@@ -124,6 +132,7 @@ class CLIPLRPWrapper:
         text_input_ids: torch.Tensor,
         text_attention_mask: torch.Tensor,
         method: str = "transformer_attribution",
+        embed_modifier=None,
     ) -> tuple[torch.Tensor, float]:
         """
         Generate attribution map for image-text similarity.
@@ -134,14 +143,20 @@ class CLIPLRPWrapper:
         text_input_ids : [1, seq_len]
         text_attention_mask : [1, seq_len]
         method : "transformer_attribution" | "attention_rollout" | "gradient"
+        embed_modifier : optional callable (unnorm_embed) -> unnorm_embed; only used
+            by transformer_attribution. Pass to inject feature-space ablations.
 
         Returns
         -------
         attribution : [grid_size, grid_size] float tensor, normalized to [0, 1]
         similarity : cosine similarity score (float)
         """
+        if method == "transformer_attribution":
+            return self._transformer_attribution(
+                pixel_values, text_input_ids, text_attention_mask,
+                embed_modifier=embed_modifier,
+            )
         dispatch = {
-            "transformer_attribution": self._transformer_attribution,
             "attention_rollout": self._attention_rollout_attribution,
             "gradient": self._gradient_attribution,
         }
@@ -160,6 +175,7 @@ class CLIPLRPWrapper:
         pixel_values: torch.Tensor,
         text_input_ids: torch.Tensor,
         text_attention_mask: torch.Tensor,
+        embed_modifier=None,
     ) -> tuple[torch.Tensor, float]:
         """
         Text-conditioned transformer attribution.
@@ -170,13 +186,15 @@ class CLIPLRPWrapper:
              on the specific text prompt — different prompts give different maps).
           3. Per layer: cam = (attn * grad).clamp(min=0), averaged over heads.
           4. Rollout the per-layer cams from the CLS token row.
+
+        embed_modifier: optional callable forwarded to _vision_forward (see its docstring).
         """
         device = pixel_values.device
         text_embeds = self._text_embeds(text_input_ids, text_attention_mask)
 
         self.model.zero_grad()
         image_embeds, attentions = self._vision_forward(
-            pixel_values, retain_attn_grad=True
+            pixel_values, retain_attn_grad=True, embed_modifier=embed_modifier
         )
 
         similarity = (image_embeds * text_embeds).sum(dim=-1)
@@ -290,6 +308,7 @@ class CLIPLRPWrapper:
         text_attention_mask: torch.Tensor,
         original_image_np: np.ndarray,
         method: str = "transformer_attribution",
+        embed_modifier=None,
     ) -> tuple[np.ndarray, float]:
         """
         Run attribution and produce a heatmap overlaid on the image.
@@ -301,6 +320,7 @@ class CLIPLRPWrapper:
         text_attention_mask : [1, seq_len]
         original_image_np : H×W×3 float32 RGB array in [0, 1]
         method : attribution method name
+        embed_modifier : optional callable forwarded to generate_lrp_image_text_attribution.
 
         Returns
         -------
@@ -310,7 +330,8 @@ class CLIPLRPWrapper:
         import cv2
 
         attribution, similarity = self.generate_lrp_image_text_attribution(
-            pixel_values, text_input_ids, text_attention_mask, method=method
+            pixel_values, text_input_ids, text_attention_mask, method=method,
+            embed_modifier=embed_modifier,
         )
 
         attr_np = attribution.cpu().numpy() if isinstance(attribution, torch.Tensor) else attribution

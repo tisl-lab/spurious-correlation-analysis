@@ -1,15 +1,77 @@
-# Core CLIP - install from OpenAI GitHub (as per official README)
-# Run: pip install git+https://github.com/openai/CLIP.git
-# Then install the rest below:
+# =============================================================================
+# Requirements for msae_ftclip / Clip-sp-rel workspace
+# Tested on Compute Canada (Cedar / Graham / Narval / Béluga)
+# Python 3.10  |  CUDA 11.8
+#
+# INSTALL ORDER — run these commands in sequence on the login node or in your
+# job script after activating your virtualenv:
+#
+#   # 1. Load CC modules first
+#   module load python/3.10 cuda/11.8 cudnn
+#   source "$PROJECT/clip_env/bin/activate"
+#
+#   # 2. PyTorch + torchvision.
+#   #    - On clusters where CC provides its own wheelhouse (packages show a
+#   #      "+computecanada" version suffix, e.g. "torch 2.13.0+computecanada"),
+#   #      install BOTH from the wheelhouse so they match:
+#   #        pip install --no-index torch torchvision
+#   #    - Otherwise (no CC wheelhouse / generic Linux box), install from the
+#   #      PyTorch wheel index instead — PyPI alone gives a CPU-only build:
+#   #        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+#   # 3. OpenAI CLIP — not on PyPI or any wheelhouse; install from GitHub.
+#   #    If the server has no internet access at all (not even the login
+#   #    node), clone it on a machine that does and transfer it over instead:
+#   #      (local)  git clone https://github.com/openai/CLIP.git
+#   #      (local)  scp -r CLIP username@cluster:~/CLIP
+#   #      (server) pip install ~/CLIP
+#   #    Otherwise, if only the compute nodes are offline (the usual case —
+#   #    login nodes have internet), just run this from the login node:
+#   pip install git+https://github.com/openai/CLIP.git
+#
+#   # 4. Everything else — try the CC wheelhouse first (fast, guaranteed
+#   #    ABI-compatible with loaded modules), then fall back to PyPI for
+#   #    whatever the wheelhouse doesn't have:
+#   pip install --no-index numpy scipy pandas matplotlib Pillow scikit-learn \
+#       scikit-image tqdm einops seaborn transformers ftfy regex opencv-python 2>/dev/null
+#   pip install -r requirements.txt
+#
+# NOTE: torch and torchvision are intentionally excluded from this file
+#       because they require a custom --index-url (or --no-index) on CC.
+# =============================================================================
 
-torch>=1.7.1
-torchvision>=0.8.2
+# ── NLP / tokenisation (required by OpenAI CLIP) ─────────────────────────────
 ftfy>=6.0.0
 regex>=2021.8.3
-tqdm>=4.62.0
-Pillow>=8.3.0
+
+# ── HuggingFace (LRP heatmaps via CLIPLRPWrapper) ────────────────────────────
+transformers>=4.30.0
+
+# ── Array / numeric ───────────────────────────────────────────────────────────
 numpy>=1.21.0
-scikit-learn>=1.0.0
-matplotlib>=3.4.0
+scipy>=1.7.0
+
+# ── Data wrangling ────────────────────────────────────────────────────────────
 pandas>=1.3.0
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.4.0,<3.9   # overcomplete's cmaps.py still calls the removed plt.cm.get_cmap() API
 seaborn>=0.11.0
+# headless build — no display required on compute nodes
+
+
+# ── Image processing ──────────────────────────────────────────────────────────
+Pillow>=8.3.0
+scikit-image>=0.19.0
+opencv-python-headless>=4.5.0   # cv2, used by msae_ftclip.py; headless = no GUI/X11 deps
+
+# ── ML utilities ─────────────────────────────────────────────────────────────
+scikit-learn>=1.0.0
+einops>=0.6.0
+tqdm>=4.62.0
+
+# ── SAE concept visualisation ─────────────────────────────────────────────────
+overcomplete>=0.3.0
+
+# ── Testing (optional — not needed for production runs) ───────────────────────
+pytest>=7.0.0

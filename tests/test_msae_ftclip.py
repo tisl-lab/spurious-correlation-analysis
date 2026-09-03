@@ -28,7 +28,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from msae_ftclip import (
+from msae_ftclip_beforeZeroshot import (
     make_projection_ablation_hook,
     make_sae_ablation_hook,
     save_representations,

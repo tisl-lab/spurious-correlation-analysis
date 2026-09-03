@@ -2,6 +2,7 @@ import os
 import sys
 import glob
 import warnings
+import contextlib
 import torch
 import argparse
 import logging
@@ -20,8 +21,8 @@ from torch.utils.data import Dataset
 from torchvision.datasets import CelebA
 from clip_zero_shot import CLIPZeroShot  # noqa: E402
 
-from .utils import get_device, set_seed
-
+# from .utils import get_device, set_seed
+from utils import get_device, set_seed
 """
 CLIP Embedding Extraction Utility
 
@@ -53,6 +54,7 @@ SUPPORTED_VOCABS = {
     "laion_bigrams": "msae/vocab/laion_400_bigram.txt",
     "laion": ["laion_unigram", "laion_bigrams"],  # Combined vocabulary
     "disect": "msae/vocab/clip_disect_20k.txt",
+    "waterbirds_domain": "msae/vocab/waterbirds_domain_vocab.txt",
 }
 
 logging.basicConfig(
@@ -77,18 +79,24 @@ def parse_args() -> argparse.Namespace:
                        help="Dataset to use (one of: imagenet, cc3m, celeba, or a supported vocabulary)")
     parser.add_argument("-m", "--model", type=str, default="ViT-B~32",
                        help="CLIP model variant to use (e.g., 'ViT-B~32' for 'ViT-B/32')")
-    parser.add_argument("-f", "--load_ftmodel", action="store_true", default=False,
+    parser.add_argument("--clip_mode", type=str, default="zeroshot",
+                        choices=["zeroshot", "finetuned"],
+                        help="'zeroshot': use base CLIP weights (no fine-tuning); "
+                             "'finetuned': load fine-tuned weights from model.pt in run_dir.")
+    parser.add_argument("-f", "--load_ftmodel", type=bool, default=False,
                        help="Load a fine-tuned CLIP model instead of the pretrained weights")
     parser.add_argument("-b", "--batch-size", type=int, default=4096,
                        help="Batch size for embedding extraction")
-    parser.add_argument("-s", "--train-split", default=True, action="store_true",
+    parser.add_argument("-s", "--train-split", type=bool, default=False, #action="store_true",
                        help="Use training split instead of validation/test split")
     parser.add_argument("-v", "--vocab-size", type=int, default=-1,
                        help="Vocabulary size limit (-1 for full vocabulary)")
     parser.add_argument("-w", "--workers", type=int, default=12,
                        help="Number of workers for data loading")
-    parser.add_argument("--data_dir", type=str, default="data/waterbirds",
-                       help="Root directory for Waterbirds dataset (contains metadata.csv)")
+    parser.add_argument("--data_dir", type=str, default=None,
+                       help="Root directory for Waterbirds dataset (contains metadata.csv). "
+                            "Defaults to 'data/waterbirds' when not set; pass explicitly "
+                            "to override, e.g. on a server with a different data layout.")
     parser.add_argument("--output_dir", type=str, default="results/waterbirds/embeddings",
                        help="Directory to save extracted embeddings")
     parser.add_argument("--ft_manifest", type=str, default=None,
@@ -102,9 +110,17 @@ def parse_args() -> argparse.Namespace:
                        help="Max samples per class used during fine-tuning (for run matching)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed used during fine-tuning (for run matching)")
-    parser.add_argument("--biased_ft", action="store_true", default=True,
+    parser.add_argument("--biased_ft", type=bool, default=False,
                        help="Whether the fine-tuned run used biased (spurious-aligned) training data")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Regular default path, applied only when --data_dir wasn't explicitly set
+    # (kept as a separate fallback, not the argparse default itself, so an
+    # explicit --data_dir is distinguishable from "unset").
+    if args.data_dir is None:
+        args.data_dir = "data/waterbirds"
+
+    return args
 
 
 class VocabDataset(Dataset):
@@ -293,30 +309,44 @@ class EmbeddingExtractor:
         self.model.eval()
     
     @staticmethod
-    def load_model(model_name, device, ft_model = False ,model_path=None):
+    def load_model(model_name, device, ft_model=False, model_path=None,
+                   offline_weights_dir=None):
         """
         Load a CLIP model, preprocessor, and tokenizer.
-        
+
         Args:
-            model_name (str): Name of the CLIP model variant
-            device (str): Device to load the model on
-            model_path (str, optional): Custom path for model weights
-            
+            model_name           : Name of the CLIP model variant
+            device               : Device to load the model on
+            ft_model             : If True, load fine-tuned weights from model_path
+            model_path           : Path to fine-tuned .pt file (ft_model=True) or
+                                   download_root for online load (ft_model=False)
+            offline_weights_dir  : Path to a directory saved by
+                                   CLIPZeroShot.download_and_save(). When given,
+                                   loads the zero-shot model from disk instead of
+                                   downloading (ft_model=False only).
+
         Returns:
             tuple: (model, preprocessor, tokenizer, token_max_length)
-            
+
         Raises:
             ValueError: If the model variant is not supported
         """
         if model_name not in SUPPORTED_MODELS:
             raise ValueError(f"Model {model_name} not supported, please use one of {SUPPORTED_MODELS}")
-        
+
         # Replace '~' with '/' in model name (to handle command line limitations)
         model_name = model_name.replace("~", "/")
-        
+
         # Load the model and preprocessor
         if not ft_model:
-            model, preprocessor = clip.load(model_name, device=device, download_root=model_path)
+            if offline_weights_dir:
+                zs = CLIPZeroShot.load_offline(model_name,
+                                               weights_dir=offline_weights_dir,
+                                               device=device)
+                model, preprocessor = zs.model, zs.preprocess
+            else:
+                model, preprocessor = clip.load(model_name, device=device,
+                                                 download_root=model_path)
         else:
             if model_path is None:
                 raise ValueError("model_path must be provided when ft_model=True")
@@ -348,8 +378,9 @@ class EmbeddingExtractor:
         else:
             text_embeddings = text.to(self.device)
 
-        # Extract features with mixed precision
-        with torch.no_grad(), torch.amp.autocast("cuda"):
+        # Extract features with mixed precision (autocast only supported on CUDA)
+        autocast = torch.amp.autocast("cuda") if "cuda" in str(self.device) else contextlib.nullcontext()
+        with torch.no_grad(), autocast:
             text_features = self.model.encode_text(text_embeddings)
             
         return text_features, text_embeddings.detach().cpu()
@@ -383,8 +414,9 @@ class EmbeddingExtractor:
         except Exception as e:
             pass
 
-        # Extract features with mixed precision
-        with torch.no_grad(), torch.amp.autocast("cuda"):
+        # Extract features with mixed precision (autocast only supported on CUDA)
+        autocast = torch.amp.autocast("cuda") if "cuda" in str(self.device) else contextlib.nullcontext()
+        with torch.no_grad(), autocast:
             image_features = self.model.encode_image(img)
             
         return image_features, img.detach().cpu()
@@ -645,7 +677,7 @@ def main(args):
         logger.info(f"Fine-tuned model loaded (run: {run_dir})")
     else:
         extractor = EmbeddingExtractor(args.model, device)
-        ft_suffix = ""
+        ft_suffix = "_zs"  # zero-shot prefix so files are distinct from fine-tuned
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -675,7 +707,8 @@ def main(args):
     else:
         raise ValueError(f"Dataset {args.dataset} not supported, please use one of {SUPPORTED_DATASETS + list(SUPPORTED_VOCABS.keys())}")
     
-    with torch.no_grad(), torch.amp.autocast("cuda"):
+    autocast = torch.amp.autocast("cuda") if "cuda" in str(device) else contextlib.nullcontext()
+    with torch.no_grad(), autocast:
         # Get a sample to determine embedding dimension
         dataset_size = len(dataset)
         sample = dataset[0][0]
