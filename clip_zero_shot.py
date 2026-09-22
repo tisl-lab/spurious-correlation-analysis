@@ -154,7 +154,27 @@ SPAWRIOUS224_BACKGROUND_PROMPTS = {
 #     7: " a photo of an animal in a zoo",   
 # }
 
+# CelebA: target = Blond_Hair ("shape"), spurious = Male ("color"). The hair
+# prompts are Chuang et al. 2023 ("Debiasing Vision-Language Models via
+# Biased Prompts", Table 10) verbatim, trailing period included -- it is not
+# cosmetic: on ViT-L/14 the period moves average accuracy by 4 points and
+# worst-group by 5, and this exact string reproduces their zero-shot 87.6 /
+# 72.8 (measured here on the test split: 86.9 / 74.4). ViT-B/32 with the
+# same prompts: 82.0 / 79.1.
+CELEBA_SHAPE_PROMPTS = {
+    0: "A photo of a celebrity with dark hair.",
+    1: "A photo of a celebrity with blond hair.",
+}
+CELEBA_GENDER_PROMPTS = {
+    0: "a photo of a woman",
+    1: "a photo of a man",
+}
+
 PROMPT_SETS = {
+    "celeba": {
+        "shape": CELEBA_SHAPE_PROMPTS,
+        "color": CELEBA_GENDER_PROMPTS,
+    },
     "mnist": {
         "shape": MNIST_SHAPE_PROMPTS,
         "color": MNIST_COLOR_PROMPTS,

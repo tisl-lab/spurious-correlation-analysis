@@ -29,9 +29,11 @@ from routesae import (
 )
 
 __all__ = [
-    'load_routesae_for_clip', 'image_concepts', 'routesae_embeds',
+    'load_routesae_for_clip', 'image_concepts', 'patch_concept_activations',
+    'dataset_patch_activations', 'save_patch_activations', 'load_patch_activations',
+    'PatchActivations', 'routesae_embeds',
     'routesae_embeds_projection', 'routesae_embeds_batched',
-    'extract_routesae_representations', 'self_check',
+    'extract_routesae_representations', 'concept_layer_origins', 'self_check',
 ]
 
 
@@ -83,6 +85,45 @@ def image_concepts(
     elif pool == 'mean':
         return patches.mean(dim=1)
     raise ValueError(f"pool must be one of 'max', 'sum', 'mean', 'cls'; got {pool}")
+
+
+@torch.no_grad()
+def patch_concept_activations(
+    sae: RouteSAE,
+    clip_model,
+    pixel_values: torch.Tensor,
+    concept_ids: Sequence[int],
+    aggre: str = 'sum',
+    routing: str = 'hard',
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-PATCH activation of the given concepts, before any pooling.
+
+    image_concepts() max-pools RouteSAE's per-patch codes into one vector per
+    image, which is what every concept selector consumes -- but that throws
+    away WHERE in the image each concept fired. This returns that: the same
+    latents, sliced to `concept_ids`, with the patch axis reshaped to the
+    ViT's grid so it can be drawn over the image.
+
+    Returns
+    -------
+    grid : (B, C, g, g)   activation of concept c at each patch, g x g grid
+                          (7 x 7 for ViT-B/32 at 224px). CLS excluded.
+    cls  : (B, C)         the CLS token's activation, for reference -- with
+                          pool='max' the image-level value is max(cls, grid).
+    Read a map as "how strongly the SAE selected concept c for each patch";
+    the argmax patch is the one that set the image-level (max-pooled) value.
+    """
+    stack = clip_layer_stack(clip_model, pixel_values, sae.n_layers)
+    x, _, _ = pre_process(stack)
+    _, _, latents, _, _ = sae(x, aggre, routing)          # (B, T, latent)
+    idx = torch.as_tensor(list(concept_ids), device=latents.device, dtype=torch.long)
+    sel = latents[:, :, idx]                              # (B, T, C)
+    n_patches = sel.shape[1] - 1
+    g = int(round(n_patches ** 0.5))
+    if g * g != n_patches:
+        raise ValueError(f"{n_patches} patches is not a square grid")
+    grid = sel[:, 1:, :].permute(0, 2, 1).reshape(sel.shape[0], len(concept_ids), g, g)
+    return grid, sel[:, 0, :]
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +217,7 @@ def routesae_embeds_projection(
             h.remove()
 
 
+@torch.no_grad()
 def routesae_embeds_batched(
     sae: RouteSAE,
     clip_model,
@@ -195,6 +237,11 @@ def routesae_embeds_batched(
     to batch the exhaustive "does zeroing concept c flip any prediction"
     search across all active concepts, rather than looping one concept at a
     time (each of which re-pays the router/layer-selection forward pass).
+
+    @torch.no_grad matches routesae_embeds above. clip_layer_stack manages
+    its own no_grad, but the hooked clip_forward_last_hidden pass below did
+    not -- across the tens of thousands of calls Generate_Concept_Pool makes,
+    the retained graphs were enough to exhaust MPS.
     """
     stack = clip_layer_stack(clip_model, pixel_values, sae.n_layers)
     x, _, _ = pre_process(stack)
@@ -271,6 +318,280 @@ def extract_routesae_representations(
         'image_paths': image_paths,
         'metrics': metrics_all,
     }
+
+
+class PatchActivations:
+    """Per-patch activations of a concept list over a whole dataset, sparse.
+
+    Dense would be (N_images, C, g*g): 5,794 x 16,309 x 49 for the full
+    RouteSAE dictionary on waterbirds -- 4.6 billion floats. Almost all are
+    zero (the codes are TopK-sparse), so only the non-zero entries are kept
+    in COO form, which also makes the file size proportional to how many
+    concepts actually fire rather than to the size of the grid.
+
+    Attributes
+    ----------
+    concept_ids : (C,) int    the concepts, in the order `cpos` indexes
+    image_paths : list[str]   the dataset's images, in the order `img` indexes
+    grid        : int         g -- the ViT patch grid is g x g
+    img, cpos, patch, value : (nnz,) arrays -- image index, position of the
+                  concept in concept_ids, patch index (row-major, CLS
+                  excluded), activation
+    cls         : (N, C) float16  CLS-token activation per image/concept
+    """
+
+    def __init__(self, concept_ids, image_paths, grid, img, cpos, patch, value, cls):
+        import numpy as np
+        self.concept_ids = np.asarray(concept_ids, dtype=np.int64)
+        self.image_paths = list(image_paths)
+        self.grid = int(grid)
+        self.img, self.cpos, self.patch, self.value = img, cpos, patch, value
+        self.cls = cls
+        self._pos = {int(c): i for i, c in enumerate(self.concept_ids)}
+        # Sorted by (concept, image) so per-concept lookups are one slice.
+        order = np.lexsort((self.img, self.cpos))
+        self.img, self.cpos = self.img[order], self.cpos[order]
+        self.patch, self.value = self.patch[order], self.value[order]
+        self._bounds = np.searchsorted(self.cpos, np.arange(len(self.concept_ids) + 1))
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def concept_entries(self, cid):
+        """(img, patch, value) arrays of every non-zero patch of concept cid."""
+        i = self._pos[int(cid)]
+        a, b = self._bounds[i], self._bounds[i + 1]
+        return self.img[a:b], self.patch[a:b], self.value[a:b]
+
+    def grid_for(self, image_idx, cid):
+        """Dense (g, g) map of concept cid on one image."""
+        import numpy as np
+        img, patch, value = self.concept_entries(cid)
+        m = img == image_idx
+        out = np.zeros(self.grid * self.grid, dtype=np.float32)
+        out[patch[m]] = value[m]
+        return out.reshape(self.grid, self.grid)
+
+    def image_max(self, cid):
+        """(N,) max over patches per image -- reproduces image_concepts(pool='max')
+        up to the CLS token, which is folded in here."""
+        import numpy as np
+        img, _patch, value = self.concept_entries(cid)
+        out = np.zeros(len(self.image_paths), dtype=np.float32)
+        np.maximum.at(out, img, value)
+        return np.maximum(out, self.cls[:, self._pos[int(cid)]].astype(np.float32))
+
+    def top_patches(self, cid, k=5):
+        """The k strongest (image_idx, patch_idx, value) triples of the concept
+        anywhere in the dataset."""
+        import numpy as np
+        img, patch, value = self.concept_entries(cid)
+        sel = np.argsort(-value)[:k]
+        return list(zip(img[sel].tolist(), patch[sel].tolist(), value[sel].tolist()))
+
+    def position_histogram(self, cid):
+        """(g, g) count of how often each patch position holds the concept's
+        per-image maximum -- flat for a content feature, peaked for a
+        positional one (a concept that only ever fires on the bottom row
+        shows up here immediately)."""
+        import numpy as np
+        img, patch, value = self.concept_entries(cid)
+        hist = np.zeros(self.grid * self.grid, dtype=np.int64)
+        if len(img):
+            # per-image argmax: entries are sorted by img within the concept
+            starts = np.r_[0, np.flatnonzero(np.diff(img)) + 1]
+            ends = np.r_[starts[1:], len(img)]
+            for a, b in zip(starts, ends):
+                hist[patch[a + int(np.argmax(value[a:b]))]] += 1
+        return hist.reshape(self.grid, self.grid)
+
+
+@torch.no_grad()
+def dataset_patch_activations(
+    sae: RouteSAE,
+    clip_model,
+    dataset,
+    concept_ids: Sequence[int],
+    device,
+    preprocess,
+    batch_size: int = 64,
+    concept_chunk: int = 512,
+    aggre: str = 'sum',
+    routing: str = 'hard',
+) -> PatchActivations:
+    """patch_concept_activations() swept over every image of `dataset`, kept
+    sparse -- see PatchActivations for what comes back and how to read it.
+
+    One CLIP + RouteSAE forward per batch, the same cost as
+    concept_layer_origins (a pass over the split); the concept list is
+    sliced in chunks of `concept_chunk` so a full-dictionary request never
+    materialises a (B, 16384, 49) tensor at once.
+    """
+    import numpy as np
+    from PIL import Image
+
+    concept_ids = [int(c) for c in concept_ids]
+    samples = dataset.samples if hasattr(dataset, 'samples') else dataset
+    paths_all = [c[0] if isinstance(c, (tuple, list)) else c for c in samples]
+    N, C = len(paths_all), len(concept_ids)
+
+    img_l, cpos_l, patch_l, val_l = [], [], [], []
+    cls_all = np.zeros((N, C), dtype=np.float16)
+    grid_g = None
+
+    idx_all = torch.as_tensor(concept_ids, dtype=torch.long)
+    for start in range(0, N, batch_size):
+        paths = paths_all[start:start + batch_size]
+        pixel_values = torch.stack(
+            [preprocess(Image.open(p).convert('RGB')) for p in paths]).to(device)
+        # ONE forward per batch; the concept list is sliced from its output.
+        # (Calling patch_concept_activations per chunk would redo the CLIP +
+        # SAE forward once per chunk -- 32x the work for a full dictionary.)
+        stack = clip_layer_stack(clip_model, pixel_values, sae.n_layers)
+        x, _, _ = pre_process(stack)
+        _, _, latents, _, _ = sae(x, aggre, routing)                  # (B, T, latent)
+        n_patches = latents.shape[1] - 1
+        grid_g = int(round(n_patches ** 0.5))
+        for c0 in range(0, C, concept_chunk):
+            idx = idx_all[c0:c0 + concept_chunk].to(latents.device)
+            sel = latents[:, :, idx]                                   # (B, T, c)
+            flat = sel[:, 1:, :].permute(0, 2, 1).contiguous().cpu()   # (B, c, g*g)
+            nz = flat.nonzero(as_tuple=False).numpy()                  # (nnz, 3)
+            if len(nz):
+                img_l.append(nz[:, 0] + start)
+                cpos_l.append(nz[:, 1] + c0)
+                patch_l.append(nz[:, 2])
+                val_l.append(flat[nz[:, 0], nz[:, 1], nz[:, 2]].numpy())
+            cls_all[start:start + len(paths), c0:c0 + len(idx)] = \
+                sel[:, 0, :].cpu().numpy().astype(np.float16)
+
+    cat = lambda parts, dt: (np.concatenate(parts).astype(dt) if parts
+                             else np.zeros(0, dtype=dt))
+    return PatchActivations(
+        concept_ids=concept_ids, image_paths=paths_all, grid=grid_g or 0,
+        img=cat(img_l, np.int32), cpos=cat(cpos_l, np.int32),
+        patch=cat(patch_l, np.int16), value=cat(val_l, np.float32), cls=cls_all,
+    )
+
+
+def save_patch_activations(pa: PatchActivations, path: str) -> None:
+    import numpy as np, os
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp.npz"
+    np.savez_compressed(
+        tmp, concept_ids=pa.concept_ids, image_paths=np.array(pa.image_paths),
+        grid=np.int64(pa.grid), img=pa.img, cpos=pa.cpos, patch=pa.patch,
+        value=pa.value, cls=pa.cls)
+    os.replace(tmp, path)
+
+
+def load_patch_activations(path: str) -> PatchActivations:
+    import numpy as np
+    z = np.load(path)
+    return PatchActivations(
+        concept_ids=z['concept_ids'], image_paths=z['image_paths'].tolist(),
+        grid=int(z['grid']), img=z['img'], cpos=z['cpos'], patch=z['patch'],
+        value=z['value'], cls=z['cls'])
+
+
+@torch.no_grad()
+def concept_layer_origins(
+    sae: RouteSAE,
+    clip_model,
+    dataset,
+    candidate_concepts: Sequence[int],
+    device,
+    preprocess,
+    batch_size: int = 32,
+    include_cls: bool = True,
+    aggre: str = 'sum',
+    routing: str = 'hard',
+) -> Dict[int, Dict[str, object]]:
+    """Which CLIP layer each concept's activations mostly come from, over `dataset`.
+
+    Unlike a per-layer SAE, RouteSAE shares one dictionary across layers and
+    routes each PATCH to a layer per forward pass (routesae.py's
+    RouteSAE.get_router_weights/get_sae_input) -- "layer" isn't a fixed
+    attribute of a concept id the way it would be for a per-layer dictionary.
+    Under hard routing (the default everywhere in this project) each patch is
+    still routed to exactly one layer per pass, so this measures it
+    empirically: for every image where a candidate concept is active (its
+    strongest patch activation is > 0), look up which layer that patch was
+    routed to (routesae.routed_layers' formula, inlined here to reuse one
+    forward pass instead of two), and tally. Returns, per concept:
+
+        layer_counts     : {layer: n_images} for every layer with >0 counts
+        mode_layer       : the single most common layer (None if never active)
+        purity           : mode_layer's share of all active images -- low
+                            purity means the concept doesn't have a stable
+                            single-layer origin, which is worth surfacing
+                            rather than silently picking the mode anyway
+        n_active_images  : how many images (out of len(dataset)) the concept
+                            was active in at all
+
+    Raises ValueError for routing='soft': soft routing blends every layer
+    into each patch, so there is no single origin layer to attribute.
+    """
+    from PIL import Image
+
+    if routing != 'hard':
+        raise ValueError(
+            "concept_layer_origins only makes sense for routing='hard' -- "
+            "'soft' routing mixes every layer into each patch, so no single "
+            "origin layer exists to attribute a concept to."
+        )
+
+    cand = list(candidate_concepts)
+    cand_t = torch.tensor(cand, device=device, dtype=torch.long)
+    counts = torch.zeros(len(cand), sae.n_routed_layers, dtype=torch.long)
+    n_active = torch.zeros(len(cand), dtype=torch.long)
+
+    samples = dataset.samples if hasattr(dataset, 'samples') else dataset
+    for start in range(0, len(samples), batch_size):
+        chunk = samples[start:start + batch_size]
+        paths = [c[0] if isinstance(c, (tuple, list)) else c for c in chunk]
+        imgs = [preprocess(Image.open(p).convert('RGB')) for p in paths]
+        pixel_values = torch.stack(imgs).to(device)
+
+        stack = clip_layer_stack(clip_model, pixel_values, sae.n_layers)
+        x, _, _ = pre_process(stack)
+        _, _, latents, _, router_weights = sae(x, aggre, routing)
+        # 0-based, relative to sae.start_layer -- routesae.routed_layers adds
+        # start_layer to report true CLIP layer numbers; done below instead,
+        # once per concept, after aggregating.
+        layer_per_patch = router_weights.argmax(dim=-1)          # (B, T)
+
+        patches = latents if include_cls else latents[:, 1:, :]
+        layers  = layer_per_patch if include_cls else layer_per_patch[:, 1:]
+
+        cand_latents = patches[:, :, cand_t]                     # (B, T, n_cand)
+        max_vals, max_patch = cand_latents.max(dim=1)             # (B, n_cand)
+        origin_layer = layers.gather(1, max_patch)                # (B, n_cand)
+
+        active = (max_vals > 0).cpu()
+        origin_layer = origin_layer.cpu()
+        for b in range(active.size(0)):
+            active_cols = active[b].nonzero(as_tuple=True)[0]
+            if active_cols.numel() == 0:
+                continue
+            for ci, lyr in zip(active_cols.tolist(), origin_layer[b, active_cols].tolist()):
+                counts[ci, lyr] += 1
+                n_active[ci] += 1
+
+    results: Dict[int, Dict[str, object]] = {}
+    for i, cid in enumerate(cand):
+        row, total = counts[i], int(n_active[i].item())
+        if total == 0:
+            results[cid] = dict(layer_counts={}, mode_layer=None, purity=0.0, n_active_images=0)
+            continue
+        mode_idx = int(row.argmax().item())
+        results[cid] = dict(
+            layer_counts={sae.start_layer + j: int(c) for j, c in enumerate(row.tolist()) if c > 0},
+            mode_layer=sae.start_layer + mode_idx,
+            purity=int(row[mode_idx].item()) / total,
+            n_active_images=total,
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------

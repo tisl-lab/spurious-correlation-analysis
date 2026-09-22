@@ -28,6 +28,7 @@ USAGE:
 import argparse
 from ast import arg
 import glob
+import hashlib
 import os
 import re
 import sys
@@ -2094,19 +2095,52 @@ def find_spurious_concepts_highmag(
 ):
     """High-Magnitude Concept Selection on misaligned+misclassified images.
 
+    Scores concepts on the target images ONLY -- deliberately no comparison
+    against aligned/correctly-classified images -- combining two metrics:
+
+      prevalence(c) = #{x : a_c(x) > 0} / n_target
+          how many of the target images the concept is present in at all.
+      strength(c)   = mean a_c(x) over just those images it is present in
+          how hard it fires when it does -- the raw activation, so a concept
+          firing twice as hard scores twice as high. Averaged over the
+          images it fires in rather than over all n_target, so it stays
+          independent of prevalence instead of folding it in a second time
+          (the score below already multiplies the two).
+
+      score(c) = prevalence(c) × strength(c)
+
+    Nothing is thresholded away: every non-zero activation contributes, in
+    proportion to its size. (Equivalently, the product is just the mean
+    activation over all n_target images -- the two factors are its
+    decomposition into "how often" and "how hard".) τ is still computed and
+    reported as a scale reference for reading the strength column, but no
+    longer gates anything: gating at τ made every activation below it worth
+    the same as zero, and every activation above it worth the same as a very
+    large one.
+
     Steps
     -----
-    1. τ = mean activation over *active* (non-zero) SAE latents across target images.
-    2. P(c) = #{x : a_c(x) > τ}  — raw count of target images where concept c fires above τ.
-    3. Return top-n_concepts by P(c) (highest frequency).
+    1. prevalence / strength / score per concept, as above.
+    2. Keep EVERY concept scoring above zero within each misaligned group,
+       then return the union sorted by score, descending. (The previous
+       top-n_concepts selection is left commented out in place at that step.)
 
-    Target images: groups 1 and 2 (misaligned) that are also misclassified by clip_ft.
+    top_n_concepts no longer limits what is returned -- it now only caps how
+    many rows the report prints, since the returned list can run to thousands
+    of concepts.
+
+    Target images: groups 1 and 2 (misaligned) that are also misclassified by
+    clip_ft, scored separately per group (so each group gets its own τ). A
+    concept reaching the top-n of both groups keeps its higher score, and its
+    source group is the group that produced that score.
 
     Returns
     -------
-    all_candidate_concepts  : list[int]
-    concept_source_group    : dict[int, int]    cid → source gid_mis
-    concept_mis_prevalence  : dict[int, float]  cid → P(c) / n_target  (fraction)
+    all_candidate_concepts  : list[int]          sorted by score, descending
+    concept_source_group    : dict[int, int]     cid → source gid_mis
+    concept_mis_prevalence  : dict[int, float]   cid → prevalence(c)
+    concept_scores          : dict[int, float]   cid → score(c), the values
+                              all_candidate_concepts is sorted by
     """
     te_reps_np    = te_results["sae_representations"].cpu().numpy()   # (N, L)
     group_ids_arr = np.array([s[3] for s in test_ds.samples])
@@ -2116,10 +2150,20 @@ def find_spurious_concepts_highmag(
     all_candidate_concepts = []
     concept_source_group   = {}
     concept_mis_prevalence = {}
+    concept_scores         = {}
+
+    def _cname(cid):
+        return (
+            vocab_names[concept_match_scores[:, cid].argmax()]
+            if vocab_names is not None and concept_match_scores is not None
+            else str(cid)
+        )
 
     report_lines = [
         "High-Magnitude Concept Selection",
-        f"Top {top_n_concepts} concepts per misaligned+misclassified group",
+        f"Every concept scoring > 0 per misaligned+misclassified group, "
+        f"ranked by score = prevalence x strength "
+        f"(tables below show the top {top_n_concepts})",
         "=" * 80,
     ]
 
@@ -2151,37 +2195,101 @@ def find_spurious_concepts_highmag(
             report_lines.append("  No misclassified images — skipping.")
             continue
 
-        # ── Step 1: τ = mean of active (non-zero) activations ────────────────
+        # τ is a scale reference for reading the strength column below -- it
+        # does NOT gate the score (see docstring).
         mis_reps  = te_reps_np[misclassified]              # (n_mis, L)
         active    = mis_reps[mis_reps > 0]
         tau       = float(active.mean()) if len(active) > 0 else 0.0
-        print(f"  τ (mean active activation): {tau:.6f}")
+        print(f"  τ (mean active activation, reference only): {tau:.6f}")
 
-        # ── Step 2: P(c) = #{x : a_c(x) > τ} ────────────────────────────────
-        counts = (mis_reps > tau).sum(axis=0)              # (L,) int counts
+        # ── Step 1: the two scoring metrics, over the target images only ────
+        present    = mis_reps > 0                          # (n_mis, L) bool
+        counts     = present.sum(axis=0)                   # (L,)
+        prevalence = counts / n_mis                        # (L,) in [0, 1]
+        # Mean activation across only the images the concept is present in
+        # (hence the divide by counts, not n_mis) -- see the docstring for
+        # why this is kept independent of prevalence. Masked rather than a
+        # plain column sum so a negative activation, if an SAE variant ever
+        # produces one, can't quietly cancel a positive one.
+        strength   = np.where(
+            counts > 0,
+            (mis_reps * present).sum(axis=0) / np.maximum(counts, 1),
+            0.0,
+        )
 
-        # ── Step 3: select top-n by count ────────────────────────────────────
-        top_indices = np.argsort(counts)[::-1][:top_n_concepts]
-        top_indices = [int(c) for c in top_indices if counts[c] > 0]
+        scores = prevalence * strength
+
+        # ── Step 2 (previous): select top-n by score ─────────────────────────
+        # Kept for reference -- superseded by the score > 0 selection below,
+        # which returns every scoring concept instead of a fixed-size head.
+        # top_indices = np.argsort(scores)[::-1][:top_n_concepts]
+        # top_indices = [int(c) for c in top_indices if counts[c] > 0]
+
+        # ── Step 2: select EVERY concept scoring above zero ──────────────────
+        # Still ordered by score descending, just no longer truncated.
+        ranked      = np.argsort(scores)[::-1]
+        top_indices = [int(c) for c in ranked if scores[c] > 0]
+        print(f"  Concepts scoring > 0: {len(top_indices):,} / {scores.shape[0]:,}")
+
+        # Every scoring concept is carried forward, regardless of how many
+        # the report prints below.
+        for cid in top_indices:
+            # A concept can score in both groups -- keep the stronger
+            # evidence, and report the group that produced it.
+            if float(scores[cid]) > concept_scores.get(cid, -1.0):
+                concept_scores[cid]         = float(scores[cid])
+                concept_source_group[cid]   = gid_mis
+                concept_mis_prevalence[cid] = float(prevalence[cid])
 
         report_lines += [
-            f"  τ = {tau:.6f}",
-            f"  {'Concept':<12}  {'Count':>7}  {'Fraction':>9}  {'Name'}",
-            "  " + "-" * 60,
+            f"  τ = {tau:.6f}  (reference scale only -- not a threshold)",
+            f"  score = prevalence x strength  (prevalence = fraction of the {n_mis} "
+            f"target images the concept is present in; strength = its mean "
+            f"activation across just those images)",
+            f"  Concepts scoring > 0: {len(top_indices):,} / {scores.shape[0]:,} "
+            f"(all returned; the table below lists the top {top_n_concepts})",
+            f"  {'Concept':<10}  {'Score':>10}  {'Count':>7}  {'Prevalence':>11}  {'Strength':>9}  {'Name'}",
+            "  " + "-" * 78,
         ]
-        for cid in top_indices:
-            frac  = counts[cid] / n_mis
-            cname = (
-                vocab_names[concept_match_scores[:, cid].argmax()]
-                if vocab_names is not None and concept_match_scores is not None
-                else str(cid)
+        for cid in top_indices[:top_n_concepts]:
+            report_lines.append(
+                f"  {cid:<10}  {scores[cid]:>10.4f}  {counts[cid]:>7}  "
+                f"{prevalence[cid]*100:>10.1f}%  {strength[cid]:>9.4f}  {_cname(cid)}"
             )
-            report_lines.append(f"  {cid:<12}  {counts[cid]:>7}  {frac*100:>8.1f}%  {cname}")
-            if cid not in concept_source_group:
-                concept_source_group[cid]   = gid_mis
-                concept_mis_prevalence[cid] = float(frac)
+        if len(top_indices) > top_n_concepts:
+            report_lines.append(
+                f"  ... and {len(top_indices) - top_n_concepts:,} more with score > 0"
+            )
 
-        all_candidate_concepts.extend(c for c in top_indices if c not in all_candidate_concepts)
+    # ── Final candidate list: union of both groups, globally score-sorted ───
+    all_candidate_concepts = sorted(
+        concept_scores, key=lambda cid: concept_scores[cid], reverse=True
+    )
+
+    if all_candidate_concepts:
+        # All of them are returned; the table is capped so a list running to
+        # thousands of concepts doesn't bury the rest of the report (and the
+        # stdout dump of it) -- raise --top_k_concepts to see further down.
+        shown = all_candidate_concepts[:top_n_concepts]
+        report_lines += [
+            "\n" + "=" * 80,
+            f"Combined candidate list — {len(all_candidate_concepts):,} concepts "
+            f"with score > 0, sorted by score (descending); top {len(shown)} shown",
+            "=" * 80,
+            f"  {'Rank':>4}  {'Concept':<10}  {'Score':>10}  {'Prevalence':>11}  {'Group':>6}  {'Name'}",
+            "  " + "-" * 72,
+        ]
+        for rank, cid in enumerate(shown, start=1):
+            report_lines.append(
+                f"  {rank:>4}  {cid:<10}  {concept_scores[cid]:>10.4f}  "
+                f"{concept_mis_prevalence[cid]*100:>10.1f}%  "
+                f"{concept_source_group[cid]:>6}  {_cname(cid)}"
+            )
+        if len(all_candidate_concepts) > len(shown):
+            report_lines.append(
+                f"  ... and {len(all_candidate_concepts) - len(shown):,} more "
+                f"(all returned to the caller)"
+            )
 
     report_text = "\n".join(report_lines) + "\n"
     report_path = os.path.join(sae_dir, "highmag_concepts_report.txt")
@@ -2191,37 +2299,445 @@ def find_spurious_concepts_highmag(
     print(report_text)
     print(f"\nHigh-magnitude concept report saved to {report_path}")
 
-    return all_candidate_concepts, concept_source_group, concept_mis_prevalence
+    return all_candidate_concepts, concept_source_group, concept_mis_prevalence, concept_scores
 
 
+def find_concept_scope_concepts(
+            te_results, ft_results, test_ds, ft_ds,
+            concept_match_scores, vocab_names,
+            sae_dir, clip_ft, sae_model, device , candidate_concepts, save_path = None, batch_size=64
+            , image_subset_size = None, top_n_concepts=10,
+            num_samples_for_alignment=64, top_k_for_alignment=50,
+            gamma_only=0.5, gamma_exclude=0.001,
+            target_threshold=0.0, bias_threshold_sigma=1.0,
+            active_only=True, alignment_mode="pred", seed=0,
+            split="ft_train", report_label_purity=False,
+):
+    """
+    Find concepts that are highly selective as target concepts without knowing True label,
+    by comparing necessity and sufficiency of each concept for both groups.
+    Other concepts are considered as background. Those contect concepts which are highly selective
+    for one class are considered as spurious concepts. 
+    This method is label-agnostic and does not require true labels. 
+    """
+
+    import numpy as np
+    from routesae import RouteSAE
+    from routesae_adapter import dataset_patch_activations, save_patch_activations
+
+    if not isinstance(sae_model, RouteSAE):
+        raise TypeError("find_patches_per_concept needs per-patch codes -- RouteSAE only "
+                        f"(got {type(sae_model).__name__}).")
+
+    # ── Which split the concepts are found and categorised on ───────────────
+    # "ft_train" (default): the fine-tuning TRAINING images -- the data the
+    # biased model actually learned its shortcut from, so the concepts that
+    # drive its predictions there are the ones worth categorising. "test":
+    # the held-out split, for a check against unseen images. Both splits
+    # share the manifest format, so the same code serves either.
+    if split == "ft_train":
+        src_results, src_ds = ft_results, ft_ds
+    elif split == "test":
+        src_results, src_ds = te_results, test_ds
+    else:
+        raise ValueError(f"split must be 'ft_train' or 'test', got {split!r}")
+    dataset_name = "waterbirds"
+
+    # get original predictions (and true labels, for reporting only)
+    zs_stats = clip_ft.run(dataset=src_ds, prompt_mode="shape", dataset_name=dataset_name)
+    preds_all = np.asarray(zs_stats["predictions_shape"])
+    n_cls_pred = int(preds_all.max()) + 1
+
+    # ── Subset that gets per-patch codes: EQUAL numbers per PREDICTED class ──
+    # A uniform draw inherits the split's class imbalance (the test set is
+    # 78% landbird); an unequal pool would put unequal weight on the two
+    # classes' concepts. So the draw is per predicted class -- the same
+    # count for each, image_subset_size or fewer if a class has fewer --
+    # regardless of background, which never enters. Predicted class, not
+    # label, keeps the procedure label-free. image_subset_size=None uses
+    # the whole split.
+    rng_subset = np.random.default_rng(seed)
+    if image_subset_size is None:
+        index_map = list(range(len(src_ds.samples)))
+    else:
+        per_class = [np.flatnonzero(preds_all == c) for c in range(n_cls_pred)]
+        n_each = min(image_subset_size, min(len(ix) for ix in per_class if len(ix)))
+        index_map = sorted(int(i) for ix in per_class if len(ix)
+                           for i in rng_subset.choice(ix, size=n_each, replace=False))
+        print(f"[conceptscope] split={split}: {len(src_ds.samples)} images, predicted "
+              f"{[int((preds_all == c).sum()) for c in range(n_cls_pred)]} per class -> "
+              f"subset of {n_each} per predicted class = {len(index_map)} images"
+              + (f" (asked {image_subset_size}; capped by the smallest class)"
+                 if n_each < image_subset_size else ""))
+    if len(index_map) < len(src_ds.samples):
+        ds = ManifestDataset.__new__(ManifestDataset)
+        ds.samples         = [src_ds.samples[i] for i in index_map]
+        ds.clip_preprocess = src_ds.clip_preprocess
+        ds.manifest_path   = src_ds.manifest_path
+    else:
+        ds = src_ds
+
+    cids = [int(c) for c in candidate_concepts]
+    pa = dataset_patch_activations(
+        sae_model, clip_ft.model, ds, cids, device,
+        preprocess=clip_ft.preprocess, batch_size=batch_size,
+    )
+    if save_path:
+        save_patch_activations(pa, save_path)
+
+    # Self-check: max over patches (and CLS) must reproduce the cached
+    # image-level activation stage 1 wrote -- proves these are the same
+    # numbers the selectors ranked on, not a re-derivation.
+    reps = src_results["sae_representations"]
+    reps = reps.cpu().numpy() if hasattr(reps, "cpu") else np.asarray(reps)
+    err = max((float(np.abs(pa.image_max(c) - reps[index_map, c]).max()) for c in cids[:20]),
+                default=0.0)
+    if err > 1e-2:
+        print(f"  WARNING: patch maxima disagree with cached activations by up to {err:.3g}")
+
+
+    g = pa.grid
+    summary = {}
+    for cid in cids:
+        img, patch, value = pa.concept_entries(cid)
+        hist = pa.position_histogram(cid)
+        n_active = int(len(np.unique(img)))
+        summary[cid] = {
+            "n_images_active": n_active,
+            "top_patches": [
+                (index_map[i], pa.image_paths[i], p, divmod(p, g), v)
+                for i, p, v in pa.top_patches(cid)
+            ],
+            "position_hist": hist,
+            "peak_fraction": (float(hist.max() / hist.sum()) if hist.sum() else 0.0),
+        }
+    # ── ConceptScope-style necessity / sufficiency, driven by PREDICTIONS ────
+    # After Choi et al., ConceptScope (compute_alignment_score_per_latent,
+    # compute_alignment_score_per_class, concept_cateogorization). Same masks,
+    # same per-class structure, same categorisation -- but every place their
+    # code uses a label or a cosine score, this uses the model's own
+    # prediction, so no ground-truth label enters at any point:
+    #   * an image's class is its zero-shot PREDICTION ŷ (zs_stats above, the
+    #     same clip_ft.run every group analysis in this file uses)
+    #   * "top latents of a class" = top_k by mean activation over the images
+    #     PREDICTED as that class; samples are drawn from those images
+    #   * masks, as theirs: the latent's per-token map -> bilinear 224 x 224
+    #     -> min-max per image;  concept_only = image * norm**gamma_only,
+    #     concept_exclude = image * (1 - norm**gamma_exclude)  (0.001 blacks
+    #     out the latent's whole support -- every patch it fired on)
+    #   * sufficient(c) = fraction of images whose prediction SURVIVES when
+    #     only the concept's region is visible   (pred(concept_only) == ŷ)
+    #     necessary(c)  = fraction whose prediction FLIPS when the region is
+    #     removed                                 (pred(concept_exclude) != ŷ)
+    #     alignment     = (sufficient + necessary) / 2
+    #     -- in place of their cosine ratios sim(only)/sim(orig) and
+    #     sim(orig)/sim(exclude). Predictions on masked images use the very
+    #     text features clip_ft.run used, so the unmasked image reproduces ŷ
+    #     (checked and printed).
+    #   * alignment_mode="prob" swaps the hard fractions for their ratio
+    #     form on the PROBABILITY of ŷ (softmax of the same logits): a
+    #     continuous fallback for when hard fractions tie -- with 30-60
+    #     samples and a small concept region, few predictions flip, and a
+    #     column of identical values has no z-score. Both are recorded.
+    #   * categorise as theirs: z-score alignment within the class; target if
+    #     z >= target_threshold, else context; context latents with mean
+    #     activation >= mean + bias_threshold_sigma * std flagged as bias
+    # Two departures from their code that are about correctness, not method:
+    #   * masks are applied to the CENTER-CROPPED 224 x 224 tensor CLIP sees
+    #     (clip_ft.preprocess minus Normalize), not to the image squashed to
+    #     a square, so the map lands on the pixels the codes came from
+    #   * active_only: a latent's fractions are taken over the sampled images
+    #     it is ACTIVE on -- on an image where it never fires the map is all
+    #     zero, concept_only is a black image and concept_exclude the
+    #     untouched original, which says nothing about the concept
+    import json
+    import torch.nn.functional as F
+    from clip_zero_shot import PROMPT_SETS
+
+    preds = np.asarray(zs_stats["predictions_shape"])                   # ŷ per image
+    # The ONLY place a true label is read in this function, and only when
+    # report_label_purity=True: a diagnostic of how pure each predicted
+    # class is. Off by default so the procedure is label-blind by
+    # construction -- nothing below depends on it either way.
+    labels_true = np.asarray(zs_stats["true_labels"]) if report_label_purity else None
+
+    # Exactly the text features clip_ft.run(prompt_mode="shape") predicted with.
+    _shape_prompts = PROMPT_SETS[dataset_name]["shape"]
+    if isinstance(next(iter(_shape_prompts.values())), list):
+        text_emb = clip_ft._encode_text_prompts_multi(_shape_prompts).float()
+    else:
+        text_emb = clip_ft.encode_text_prompts(_shape_prompts).float()   # (n_cls, D)
+    n_cls = text_emb.shape[0]
+
+    # clip_ft.preprocess minus its Normalize: masks multiply pixels in [0, 1]
+    # as in ConceptScope; Normalize is re-applied by hand before encoding.
+    _norm = next(t for t in clip_ft.preprocess.transforms if isinstance(t, transforms.Normalize))
+    _pre  = transforms.Compose([t for t in clip_ft.preprocess.transforms
+                                if not isinstance(t, transforms.Normalize)])
+    mean = torch.tensor(_norm.mean, device=device).view(1, 3, 1, 1)
+    std  = torch.tensor(_norm.std,  device=device).view(1, 3, 1, 1)
+
+    def _apply_mask(images, masks, gamma, reverse=False):
+        """ConceptScope's apply_sae_mask_to_input_tensor with blend_rate=0."""
+        n = images.shape[0]
+        lo = masks.view(n, -1).min(dim=1, keepdim=True)[0].view(n, 1, 1, 1)
+        hi = masks.view(n, -1).max(dim=1, keepdim=True)[0].view(n, 1, 1, 1)
+        norm = ((masks - lo) / (hi - lo + 1e-10)) ** gamma
+        if reverse:
+            norm = 1.0 - norm
+        return (images * norm).clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def _predict(images01):
+        """(pred, probs) of [0,1] image tensors -- same logits as clip_ft.run."""
+        preds_, probs_ = [], []
+        for b in range(0, images01.shape[0], batch_size):
+            x = (images01[b:b + batch_size].to(device) - mean) / std
+            f = clip_ft.model.encode_image(x).float()
+            f = f / f.norm(dim=-1, keepdim=True)
+            logits = 100.0 * f @ text_emb.T
+            preds_.append(logits.argmax(dim=-1).cpu())
+            probs_.append(logits.softmax(dim=-1).cpu())
+        return torch.cat(preds_).numpy(), torch.cat(probs_).numpy()
+
+    preds_pa = preds[index_map]                    # ŷ per pa position
+    rng = np.random.default_rng(seed)
+    eps = 1e-6
+
+    alignment = {}        # predicted class -> {cid: {...}}
+    for cls_idx in range(n_cls):
+        cls_test = np.flatnonzero(preds == cls_idx)          # images PREDICTED cls
+        cls_pa   = np.flatnonzero(preds_pa == cls_idx)       # ... that pa covers
+        if len(cls_pa) == 0 or len(cls_test) == 0:
+            print(f"[conceptscope] predicted class {cls_idx}: no images -- skipped")
+            continue
+
+        cls_mean = reps[cls_test][:, cids].mean(axis=0)                  # (C,)
+        freq     = (reps[cls_test][:, cids] > 0).mean(axis=0)
+        order    = np.argsort(-cls_mean)[: min(top_k_for_alignment, len(cids))]
+        latents  = [cids[j] for j in order]
+
+        n_s = min(num_samples_for_alignment, len(cls_pa))
+        sampled = rng.choice(cls_pa, size=n_s, replace=False)
+        images01 = torch.stack([_pre(Image.open(pa.image_paths[i]).convert("RGB"))
+                                for i in sampled])                       # (n_s, 3, 224, 224)
+        pred_orig, prob_orig = _predict(images01)
+        agree = float((pred_orig == cls_idx).mean())
+        purity_note = ""
+        if labels_true is not None:
+            purity = float((labels_true[index_map][sampled] == cls_idx).mean())
+            purity_note = f" | true-label purity {purity:.0%} (diagnostic only)"
+        print(f"[conceptscope] predicted class {cls_idx}: {len(cls_test)} images, "
+              f"{n_s} sampled, {len(latents)} latents | recomputed ŷ agrees with "
+              f"zs_stats on {agree:.0%}{purity_note}")
+
+        alignment[cls_idx] = {}
+        for cid in tqdm(latents, desc=f"  class {cls_idx} latents", leave=False):
+            maps = torch.tensor(np.stack([pa.grid_for(int(i), cid) for i in sampled]))
+            maps = maps.unsqueeze(1).float()                             # (n_s, 1, g, g)
+            active = (maps.view(n_s, -1).max(dim=1).values > 0).numpy()
+            use = active if active_only else np.ones(n_s, dtype=bool)
+            if use.sum() == 0:
+                continue
+            masks = F.interpolate(maps[use], size=images01.shape[-2:],
+                                  mode="bilinear", align_corners=False)
+            imgs = images01[use]
+            only    = _apply_mask(imgs, masks, gamma_only)
+            exclude = _apply_mask(imgs, masks, gamma_exclude, reverse=True)
+            pred_only, prob_only = _predict(only)
+            pred_excl, prob_excl = _predict(exclude)
+            p_o, p_only, p_excl = (prob_orig[use][:, cls_idx], prob_only[:, cls_idx],
+                                   prob_excl[:, cls_idx])
+
+            # prediction-based (primary)
+            suff_pred = float((pred_only == cls_idx).mean())
+            nec_pred  = float((pred_excl != cls_idx).mean())
+            # probability-ratio form of the same thing (their ratio shape,
+            # on p(ŷ) instead of the cosine) -- the continuous companion
+            suff_prob = float(np.mean(p_only / np.maximum(p_o, eps)))
+            nec_prob  = float(np.mean(p_o / np.maximum(p_excl, eps)))
+
+            j = cids.index(cid)
+            alignment[cls_idx][cid] = dict(
+                latent_name=(vocab_names[concept_match_scores[:, cid].argmax()]
+                             if vocab_names is not None and concept_match_scores is not None
+                             else str(cid)),
+                sufficient_score=suff_pred, necessary_score=nec_pred,
+                alignment_score=(suff_pred + nec_pred) / 2,
+                sufficient_prob=suff_prob, necessary_prob=nec_prob,
+                alignment_prob=(suff_prob + nec_prob) / 2,
+                p_pred_orig=float(p_o.mean()), p_pred_only=float(p_only.mean()),
+                p_pred_exclude=float(p_excl.mean()),
+                mean_activation=float(cls_mean[j]), frequency_0=float(freq[j]),
+                n_images_used=int(use.sum()),
+            )
+
+    # ── Categorisation (their concept_cateogorization), per PREDICTED class ──
+    key = "alignment_score" if alignment_mode == "pred" else "alignment_prob"
+    categorization = {}
+    spurious_scores = {}          # cid -> excess over the bias threshold (its one class)
+    bias_flags = {}               # cid -> [predicted classes it was flagged bias for]
+    for cls_idx, scores in alignment.items():
+        if not scores:
+            continue
+        cids_c = list(scores)
+        al = np.array([scores[c][key] for c in cids_c])
+        if al.std() < eps:
+            print(f"[conceptscope] WARNING: predicted class {cls_idx}: every latent has "
+                  f"{key}={al[0]:.3f} -- no separation; consider alignment_mode='prob' "
+                  f"or more samples.")
+        z = (al - al.mean()) / (al.std() + eps)
+        target, context = [], []
+        for c, zc in zip(cids_c, z):
+            entry = dict(latent_idx=int(c), normalized_alignment_score=float(zc), **scores[c])
+            (target if zc >= target_threshold else context).append(entry)
+        ctx_act = np.array([e["mean_activation"] for e in context]) if context else np.zeros(0)
+        thr = (ctx_act.mean() + bias_threshold_sigma * ctx_act.std()) if len(ctx_act) else np.inf
+        for e in context:
+            e["bias"] = bool(e["mean_activation"] >= thr)
+            if e["bias"]:
+                excess = (e["mean_activation"] - thr) / (ctx_act.std() + eps)
+                spurious_scores[e["latent_idx"]] = max(
+                    spurious_scores.get(e["latent_idx"], -np.inf), float(excess))
+                bias_flags.setdefault(e["latent_idx"], []).append(int(cls_idx))
+        target.sort(key=lambda e: -e[key])
+        context.sort(key=lambda e: -e["mean_activation"])
+        categorization[str(cls_idx)] = dict(
+            target=target, context=context, bias_threshold=float(thr),
+            n_target=len(target), n_context=len(context),
+            n_bias=int(sum(e["bias"] for e in context)),
+        )
+
+    # Only concepts flagged for exactly ONE predicted class are ablated. A
+    # concept that comes out as bias for every class fires strongly and is
+    # unused by the prediction everywhere -- it does not tell the classes
+    # apart, so it cannot be the shortcut between them, and removing it only
+    # perturbs the representation. Those are recorded (JSON, report) but
+    # left out of the returned list.
+    bias_in_all = sorted(c for c, cl in bias_flags.items() if len(cl) >= 2)
+    for c in bias_in_all:
+        spurious_scores.pop(c, None)
+    spurious_concepts = sorted(spurious_scores, key=lambda c: -spurious_scores[c])
+
+    # ── Save + report ────────────────────────────────────────────────────────
+    os.makedirs(sae_dir, exist_ok=True)
+    out_json = os.path.join(sae_dir, "conceptscope_categorization.json")
+    with open(out_json, "w") as f:
+        json.dump(dict(
+            params=dict(num_samples_for_alignment=num_samples_for_alignment,
+                        top_k_for_alignment=top_k_for_alignment, gamma_only=gamma_only,
+                        gamma_exclude=gamma_exclude, target_threshold=target_threshold,
+                        bias_threshold_sigma=bias_threshold_sigma, active_only=active_only,
+                        alignment_mode=alignment_mode, seed=seed, split=split,
+                        image_subset_size_per_class=image_subset_size,
+                        n_images_with_patch_codes=len(index_map),
+                        classes_from="predictions"),
+            categorization=categorization,
+            spurious_concepts=[int(c) for c in spurious_concepts],
+            spurious_class={int(c): bias_flags[c][0] for c in spurious_concepts},
+            excluded_bias_in_multiple_classes=[int(c) for c in bias_in_all],
+            spurious_scores={int(c): v for c, v in spurious_scores.items()},
+        ), f, indent=2)
+
+    lines = [
+        "ConceptScope-style concept categorisation -- prediction-driven (no labels used)",
+        f"split: {split} ({len(index_map)} images with patch codes, equal per predicted class)",
+        f"class of an image = its zero-shot prediction; {num_samples_for_alignment} sampled "
+        f"images per predicted class, top {top_k_for_alignment} latents by class-mean activation",
+        "sufficient = P[pred(concept_only) == ŷ]   necessary = P[pred(concept_exclude) != ŷ]   "
+        f"alignment = mean  (categorised on: {key})",
+        f"target: z(alignment) >= {target_threshold}; bias: context latent with mean "
+        f"activation >= mean + {bias_threshold_sigma} sigma of context latents",
+        "=" * 96,
+    ]
+    for cls_idx, cat in categorization.items():
+        lines.append(f"\npredicted class {cls_idx}: {cat['n_target']} target, "
+                     f"{cat['n_context']} context ({cat['n_bias']} bias)")
+        lines.append(f"  {'kind':<8} {'concept':<8} {'align':>6} {'suff':>6} {'nec':>6} "
+                     f"{'alignP':>7} {'z':>6} {'meanAct':>8} {'freq':>5} {'n':>3}  name")
+        rows = cat["target"][:top_n_concepts] + [x for x in cat["context"] if x["bias"]][:top_n_concepts]
+        for e in rows:
+            kind = "target" if e in cat["target"] else "BIAS"
+            lines.append(f"  {kind:<8} {e['latent_idx']:<8} {e['alignment_score']:>6.3f} "
+                         f"{e['sufficient_score']:>6.2f} {e['necessary_score']:>6.2f} "
+                         f"{e['alignment_prob']:>7.3f} {e['normalized_alignment_score']:>+6.2f} "
+                         f"{e['mean_activation']:>8.3f} {e['frequency_0']:>5.2f} "
+                         f"{e['n_images_used']:>3}  {e['latent_name']}")
+    lines.append(f"\nspurious (bias) concepts flagged for exactly one predicted class: "
+                 f"{len(spurious_concepts)}  -> ablated")
+    if bias_in_all:
+        lines.append(f"flagged as bias for more than one class: {len(bias_in_all)}  -> NOT ablated "
+                     f"(does not separate the classes): "
+                     + ", ".join(f"{c} ({alignment[bias_flags[c][0]][c]['latent_name']})" for c in bias_in_all))
+    report_path = os.path.join(sae_dir, "conceptscope_report.txt")
+    with open(report_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"\n[conceptscope] categorisation -> {out_json}\n[conceptscope] report -> {report_path}")
+
+    return spurious_concepts, spurious_scores, categorization
+    
 def find_and_show_spurious_concepts_binary(
     te_results, ft_results, test_ds, ft_ds,
     concept_match_scores, vocab_names,
     sae_dir, clip_ft,
-    active_threshold=0.7,
-    inactive_threshold=0.7,
     top_n_concepts=10,
     sae_model= None,
     device = None,
 ):
     """
-    Find spurious concepts using a direct binary active/inactive criterion:
+    Label-guided spurious concept scoring: rank concepts by how much MORE they
+    occupy the failures than the same class on its aligned background, times
+    how hard they fire on those failures.
 
-      spurious = {c : active(c, mis) > active_threshold}
-               ∩ {c : inactive(c, low_aligned) > inactive_threshold}
+      prev_mis(c)    = #{x in mis : a_c(x) != 0} / n_mis
+          occupancy on the misaligned AND misclassified images of the group.
+      prev_low(c)    = #{x in low : a_c(x) != 0} / n_low
+          occupancy on the aligned-low contrast group -- the SAME bird class
+          on its aligned background (group 1 -> group 0, group 2 -> group 3).
+      selectivity(c) = max(prev_mis(c) - prev_low(c), 0)
+      strength(c)    = mean a_c(x) over just the mis images c fires in
 
-    where
-      active(c, mis)          = fraction of misclassified images where latent c is non-zero
-      inactive(c, low_aligned)= fraction of aligned-low-bg images where latent c is zero
+      score(c) = selectivity(c) x strength(c)
 
-    Because this uses sparse SAE latents (TopK-selected), non-zero means the SAE
-    explicitly selected that concept for the image.
+    Everything scoring above zero is returned, sorted by score descending.
+    Nothing is thresholded away -- the previous version instead intersected
+    {active in >70% of mis} with {inactive in >70% of low}, which on this
+    SAE's latents came down to the first criterion alone: at ~6% of the
+    dictionary active per image the second one passes ~97% of all concepts,
+    and the intersection was ~3 concepts per group.
+
+    selectivity SUBTRACTS the contrast occupancy rather than multiplying by
+    (1 - prev_low) for the same reason: that factor sits near 1.0 for nearly
+    every concept, so multiplying by it reproduces
+    find_spurious_concepts_highmag's ranking (rank correlation ~0.99) instead
+    of ranking by anything the contrast group tells us. Subtracting keeps the
+    label information: a concept firing just as often on the same class with
+    an aligned background is a class/appearance feature, not a background
+    one, and scores 0 however prevalent it is on the failures.
+
+    strength is the mean over the images the concept is present in (divide by
+    counts, not n_mis) -- same definition find_spurious_concepts_highmag uses,
+    so the two methods' scores stay on comparable footing.
+
+    The contrast group is deliberately NOT filtered by classification
+    correctness (unlike the mis side, which needs the extra clip_ft pass
+    below): it is the reference for what the class looks like when the
+    background agrees, which every image of it answers.
+
+    top_n_concepts does not limit what is returned -- it caps how many rows
+    each report table prints and how many concepts get example images dumped.
+
+    A concept scoring in both misaligned groups keeps its higher score, and
+    its source group is the group that produced that score.
 
     Returns
     -------
-    all_candidate_concepts  : list[int]
-    concept_source_group    : dict[int, int]   cid → gid_mis
-    concept_mis_prevalence  : dict[int, float] cid → active fraction in misclassified group
+    all_candidate_concepts  : list[int]          sorted by score, descending
+    concept_source_group    : dict[int, int]     cid → source gid_mis
+    concept_mis_prevalence  : dict[int, float]   cid → prev_mis(c)
+    concept_scores          : dict[int, float]   cid → score(c), the values
+                              all_candidate_concepts is sorted by
     """
     import shutil
 
@@ -2238,19 +2754,34 @@ def find_and_show_spurious_concepts_binary(
     MISALIGNED_GROUP_NAMES = {1: "landbird / water bg", 2: "waterbird / land bg"}
     GROUP_FOLDER            = {1: "land_bird_on_water",  2: "water_bird_on_land"}
     FT_CLASS_FOLDER         = {1: "water_birds",          2: "land_birds"}
+    # _aligned_high (group 1 -> 3, group 2 -> 0: the other class on the SAME
+    # background) is the contrast this method does NOT use -- the score below
+    # contrasts against _aligned_low, the same class on its own background.
     _aligned_high           = {1: 3, 2: 0}
     _aligned_low            = {1: 0, 2: 3}
 
     all_candidate_concepts = []
     concept_source_group   = {}
     concept_mis_prevalence = {}
+    concept_scores         = {}
+    concept_selectivity    = {}
+    concept_strength       = {}
     group_top_sets         = {}
     group_prevalence       = {}
 
+    def _cname(cid):
+        return (
+            vocab_names[concept_match_scores[:, cid].argmax()]
+            if vocab_names is not None and concept_match_scores is not None
+            else str(cid)
+        )
+
     report_lines = [
-        "Spurious Concept Analysis — binary active/inactive",
-        f"active_threshold={active_threshold}  inactive_threshold={inactive_threshold}"
-        f"  |  Top {top_n_concepts} concepts",
+        "Label-Guided Spurious Concept Selection",
+        "Every concept scoring > 0 per misaligned+misclassified group, ranked by",
+        "score = selectivity x strength, selectivity = max(prev_mis - prev_low, 0),",
+        "prev_low measured on the same class with an aligned background",
+        f"(the tables below show the top {top_n_concepts})",
         "=" * 80,
     ]
 
@@ -2284,56 +2815,91 @@ def find_and_show_spurious_concepts_binary(
             report_lines.append("  No misclassified images — skipping.")
             continue
 
-        mis_reps  = te_reps_np[misclassified]
+        mis_reps  = te_reps_np[misclassified]                     # (n_mis, L)
         low_reps  = te_reps_np[group_ids_arr == _aligned_low[gid_mis]]
 
-        # fraction of misclassified images where concept is non-zero (active)
-        active_rate = (mis_reps != 0).mean(axis=0)            # (L,)
-        # fraction of aligned-low images where concept is zero (inactive)
-        inactive_rate_low = (low_reps == 0).mean(axis=0)      # (L,)
+        # ── Occupancy on each side ───────────────────────────────────────────
+        # prev_mis: fraction of the misaligned+misclassified images the concept
+        # fires in at all (the old `active_rate`, unchanged).
+        # prev_low: the same fraction over the aligned-low contrast group --
+        # the complement of the old `inactive_rate_low`, kept in "fires in"
+        # form so the two sides subtract directly.
+        present  = mis_reps != 0                                  # (n_mis, L)
+        counts   = present.sum(axis=0)                            # (L,)
+        prev_mis = counts / n_mis                                 # (L,) in [0, 1]
+        prev_low = ((low_reps != 0).mean(axis=0) if len(low_reps)
+                    else np.zeros_like(prev_mis))                 # (L,) in [0, 1]
 
-        active_in_mis   = set(np.where(active_rate      > active_threshold)[0].tolist())
-        inactive_in_low = set(np.where(inactive_rate_low > inactive_threshold)[0].tolist())
-        spurious        = active_in_mis & inactive_in_low
-
-        report_lines.append(
-            f"  Active in >{active_threshold*100:.0f}% of misclassified: {len(active_in_mis)}\n"
-            f"  Inactive in >{inactive_threshold*100:.0f}% of aligned-low: {len(inactive_in_low)}\n"
-            f"  Intersection (spurious candidates): {len(spurious)}"
+        # Mean activation across only the images the concept is present in
+        # (hence the divide by counts, not n_mis). Masked rather than a plain
+        # column sum so a negative activation, if an SAE variant ever produces
+        # one, can't quietly cancel a positive one.
+        strength = np.where(
+            counts > 0,
+            (mis_reps * present).sum(axis=0) / np.maximum(counts, 1),
+            0.0,
         )
 
-        if not spurious:
-            report_lines.append("  No concepts meet the active∩inactive criterion — skipping.")
+        # ── The label-guided score ───────────────────────────────────────────
+        # Excess occupancy over the contrast group, times how hard the concept
+        # fires on the failures. No active/inactive thresholds: every concept
+        # scoring above zero is kept (see the docstring for why the old
+        # 0.7 ∩ 0.7 criterion and the multiplicative (1 - prev_low) form were
+        # both dropped).
+        selectivity = np.maximum(prev_mis - prev_low, 0.0)
+        scores      = selectivity * strength
+
+        ranked      = np.argsort(scores)[::-1]
+        scored_cids = [int(c) for c in ranked if scores[c] > 0]
+        print(f"  Concepts scoring > 0: {len(scored_cids):,} / {scores.shape[0]:,}")
+
+        report_lines.append(
+            f"  Aligned-low contrast group {_aligned_low[gid_mis]}: {len(low_reps)} images\n"
+            f"  Concepts scoring > 0: {len(scored_cids):,} / {scores.shape[0]:,}"
+        )
+
+        if not scored_cids:
+            report_lines.append("  No concept fires more on the failures than on the "
+                                "aligned-low group — skipping.")
             continue
 
-        # rank by activity rate in misclassified (highest first)
-        spurious_sorted = sorted(spurious, key=lambda c: active_rate[c], reverse=True)
-        all_candidate_concepts.extend(spurious_sorted)
-        for cid in spurious_sorted:
-            concept_source_group[cid]   = gid_mis
-            concept_mis_prevalence[cid] = float(active_rate[cid])
+        # A concept can score in both groups -- keep the stronger evidence, and
+        # report the group that produced it. Accumulated into dicts keyed by
+        # cid (rather than extended into a list) so a concept scoring in both
+        # appears once, with its better score.
+        for cid in scored_cids:
+            if float(scores[cid]) > concept_scores.get(cid, -1.0):
+                concept_scores[cid]         = float(scores[cid])
+                concept_source_group[cid]   = gid_mis
+                concept_mis_prevalence[cid] = float(prev_mis[cid])
+                concept_selectivity[cid]    = float(selectivity[cid])
+                concept_strength[cid]       = float(strength[cid])
 
-        top_concepts = spurious_sorted[:top_n_concepts]
+        # top_n_concepts caps this group's report table and the example-image
+        # dumps below only -- every scoring concept is carried forward above.
+        top_concepts = scored_cids[:top_n_concepts]
         group_top_sets[gid_mis]   = set(top_concepts)
-        group_prevalence[gid_mis] = {c: float(active_rate[c]) for c in top_concepts}
+        group_prevalence[gid_mis] = {c: float(prev_mis[c]) for c in top_concepts}
 
         report_lines += [
-            f"\n{'Concept ID':<12}  {'Concept Name':<30}  "
-            f"{'Active in Mis':>14}  {'Inactive in Low':>16}",
-            "-" * 78,
+            f"\n  {'Concept':<10}  {'Score':>10}  {'Prev(mis)':>10}  {'Prev(low)':>10}  "
+            f"{'Selectiv.':>10}  {'Strength':>9}  {'Name'}",
+            "  " + "-" * 86,
         ]
         for cid in top_concepts:
-            cname = vocab_names[concept_match_scores[:, cid].argmax()]
             report_lines.append(
-                f"{cid:<12}  {cname:<30}  "
-                f"{active_rate[cid]*100:>13.1f}%  {inactive_rate_low[cid]*100:>15.1f}%"
+                f"  {cid:<10}  {scores[cid]:>10.4f}  {prev_mis[cid]*100:>9.1f}%  "
+                f"{prev_low[cid]*100:>9.1f}%  {selectivity[cid]*100:>9.1f}%  "
+                f"{strength[cid]:>9.4f}  {_cname(cid)}"
+            )
+        if len(scored_cids) > top_n_concepts:
+            report_lines.append(
+                f"  ... and {len(scored_cids) - top_n_concepts:,} more with score > 0"
             )
 
         # ── Save example images per concept ──────────────────────────────────
         group_folder    = GROUP_FOLDER[gid_mis]
         ft_class_folder = FT_CLASS_FOLDER[gid_mis]
-
-        
 
         for cid in top_concepts:
             cname    = vocab_names[concept_match_scores[:, cid].argmax()]
@@ -2479,14 +3045,48 @@ def find_and_show_spurious_concepts_binary(
     #     sae_dir=sae_dir, clip_ft=clip_ft, device=device, top_n_concepts=top_n_concepts,
     # )
 
+    # ── Final candidate list: union of both groups, globally score-sorted ───
+    all_candidate_concepts = sorted(
+        concept_scores, key=lambda cid: concept_scores[cid], reverse=True
+    )
+
+    if all_candidate_concepts:
+        # All of them are returned; the table is capped so a list running to
+        # thousands of concepts doesn't bury the rest of the report (and the
+        # stdout dump of it) -- raise --top_k_concepts to see further down.
+        shown = all_candidate_concepts[:top_n_concepts]
+        report_lines += [
+            "\n" + "=" * 80,
+            f"Combined candidate list — {len(all_candidate_concepts):,} concepts "
+            f"with score > 0, sorted by score (descending); top {len(shown)} shown",
+            "=" * 80,
+            f"  {'Rank':>4}  {'Concept':<10}  {'Score':>10}  {'Prev(mis)':>10}  "
+            f"{'Selectiv.':>10}  {'Strength':>9}  {'Group':>6}  {'Name'}",
+            "  " + "-" * 88,
+        ]
+        for rank, cid in enumerate(shown, start=1):
+            report_lines.append(
+                f"  {rank:>4}  {cid:<10}  {concept_scores[cid]:>10.4f}  "
+                f"{concept_mis_prevalence[cid]*100:>9.1f}%  "
+                f"{concept_selectivity[cid]*100:>9.1f}%  "
+                f"{concept_strength[cid]:>9.4f}  "
+                f"{concept_source_group[cid]:>6}  {_cname(cid)}"
+            )
+        if len(all_candidate_concepts) > len(shown):
+            report_lines.append(
+                f"  ... and {len(all_candidate_concepts) - len(shown):,} more "
+                f"(all returned to the caller)"
+            )
+
     report_text = "\n".join(report_lines) + "\n"
     report_path = os.path.join(sae_dir, "spurious_concepts_binary_report.txt")
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
     with open(report_path, "w") as f:
         f.write(report_text)
-    print(f"\nSpurious concept binary report saved to {report_path}")
+    print(f"\nLabel-guided spurious concept report saved to {report_path}")
 
-    
-    return all_candidate_concepts, concept_source_group, concept_mis_prevalence
+    return (all_candidate_concepts, concept_source_group,
+            concept_mis_prevalence, concept_scores)
 
 
 
@@ -2654,6 +3254,33 @@ def candidate_selection(
     return M, Y_hat, M_centroid, M_knn
 
 
+def concept_pool_subset_tag(image_subset):
+    """Filename tag distinguishing a concept pool built over a restricted set
+    of images from the full-test-set one, so the two can never load each
+    other's cache. Empty string when there is no restriction, which keeps the
+    original filenames byte-identical.
+
+    Hashed rather than just counted because two different subsets of equal
+    size must not collide -- the candidate set depends on knn_k, and the pool
+    is cached in base_sae_dir, whose path does not encode knn_k."""
+    if image_subset is None:
+        return ""
+    idx = sorted(int(i) for i in image_subset)
+    h = hashlib.sha1(",".join(map(str, idx)).encode()).hexdigest()[:8]
+    return f"_sub{len(idx)}_{h}"
+
+
+def concept_pool_delta_path(sae_dir, clip_ft, latent_dim, subset_tag=""):
+    """Companion file to concept_pool_per_image_*.json holding, for each
+    (image, concept) pair whose ablation flipped the prediction, HOW MUCH
+    class probability that flip moved. Written only when
+    Generate_Concept_Pool runs with record_deltas=True; read by
+    score_labelfree_concepts."""
+    clip_tag = clip_ft.model_name.replace("/", "~")
+    return os.path.join(
+        sae_dir, f"concept_pool_per_image_delta_{clip_tag}_{latent_dim}{subset_tag}.json")
+
+
 @torch.no_grad()
 def Generate_Concept_Pool(
     te_results, test_ds,
@@ -2663,6 +3290,9 @@ def Generate_Concept_Pool(
     sae_dir=None,
     batch_size=64,
     n_workers=10,
+    record_deltas=False,
+    image_subset=None,
+    cache_images=True,
 ):
     """
     Identify every SAE concept that causally affects at least one prediction,
@@ -2680,6 +3310,41 @@ def Generate_Concept_Pool(
         concept_pool_{clip_model}_{latent_dim}.npy          — global pool
         concept_pool_per_image_{clip_model}_{latent_dim}.json — per-image pool
 
+    record_deltas : bool
+        When True, also record HOW MUCH each flip moved the class
+        probabilities -- p_orig[orig_class] - p_ablated[orig_class], with the
+        softmax taken over logit_scale-scaled cosine similarities the way the
+        rest of this file does it. Saved alongside the pools at
+        concept_pool_delta_path(); score_labelfree_concepts consumes it. The
+        default (False) leaves this function's behaviour, returns and cache
+        files exactly as they were -- flip counts only, magnitudes discarded.
+
+    image_subset : iterable[int] or None
+        Restrict the whole search to these test-image indices. Both labelfree
+        selectors downstream (select_prevalent_concepts and
+        score_labelfree_concepts) only ever look at candidate images, so
+        testing the rest is wasted compute -- on waterbirds that is 1,105 of
+        5,794 images, cutting ~6.0M (concept, image) pairs to ~1.15M for
+        identical scorer output. Concepts never active in any of these images
+        drop out of the search automatically. The saved pool then means
+        "flips at least one of THESE images", so its filenames carry a
+        subset tag (concept_pool_subset_tag) and can't be confused with a
+        full-test-set pool. None = every image, the original behaviour.
+
+    cache_images : bool
+        Preprocess each needed image ONCE and hold the tensors in RAM instead
+        of re-decoding the JPEG for every pair. Without this each image is
+        decoded ~1,000 times (6.0M pairs over 5,794 images), which on a
+        network filesystem can dominate the runtime and gains nothing from a
+        faster GPU. Costs ~600 KB per image (~0.7 GB for the candidate subset,
+        ~3.5 GB for a full 5,794-image run). Set False if RAM is tight.
+
+        Note the cache: a run with record_deltas=True only reuses the cached
+        pools if the delta file is there too, since the magnitudes cannot be
+        recovered from a pool built without them. An existing pool cache from
+        a previous (magnitude-free) run therefore forces a full recompute --
+        which is the expensive part of this function.
+
     Returns
     -------
     concept_pool   : list[int]
@@ -2696,24 +3361,49 @@ def Generate_Concept_Pool(
         from routesae_adapter import routesae_embeds_batched
 
     device     = next(clip_ft.model.parameters()).device
+    # Same MPS handling ablate_spurious_concepts uses: the caching allocator
+    # doesn't reliably release across long runs of small forward passes, and
+    # this function makes far more of them than anything else here (one per
+    # (concept, image) pair). Without the periodic flush below it climbs to
+    # "MPS backend out of memory" well before real peak usage justifies it.
+    # No-op cost on CUDA/CPU.
+    is_mps = torch.device(device).type == "mps"
+    if is_mps:
+        torch.mps.empty_cache()
     clip_tag   = clip_ft.model_name.replace("/", "~")
     te_reps    = te_results["sae_representations"]  # (N, L)
     latent_dim = te_reps.shape[1]
     te_paths   = te_results["image_paths"]
 
-    pool_fname    = f"concept_pool_{clip_tag}_{latent_dim}.npy"
-    per_img_fname = f"concept_pool_per_image_{clip_tag}_{latent_dim}.json"
+    subset_tag    = concept_pool_subset_tag(image_subset)
+    pool_fname    = f"concept_pool_{clip_tag}_{latent_dim}{subset_tag}.npy"
+    per_img_fname = f"concept_pool_per_image_{clip_tag}_{latent_dim}{subset_tag}.json"
     pool_path     = os.path.join(sae_dir, pool_fname)    if sae_dir else None
     per_img_path  = os.path.join(sae_dir, per_img_fname) if sae_dir else None
+    delta_path    = (concept_pool_delta_path(sae_dir, clip_ft, latent_dim, subset_tag)
+                     if sae_dir else None)
 
-    # ── Load from cache if both files exist ──────────────────────────────────
-    if pool_path and os.path.isfile(pool_path) and per_img_path and os.path.isfile(per_img_path):
+    # ── Load from cache if the needed files exist ────────────────────────────
+    # With record_deltas the delta file is required too: a pool cached by an
+    # earlier magnitude-free run can't supply it retroactively.
+    cache_ready = (
+        pool_path and os.path.isfile(pool_path)
+        and per_img_path and os.path.isfile(per_img_path)
+        and (not record_deltas or (delta_path and os.path.isfile(delta_path)))
+    )
+    if cache_ready:
         concept_pool = np.load(pool_path).tolist()
         with open(per_img_path) as f:
             per_image_pool = {int(k): v for k, v in json.load(f).items()}
         print(f"  Loaded concept pool ({len(concept_pool)} concepts) from {pool_path}")
         print(f"  Loaded per-image pool ({len(per_image_pool)} images) from {per_img_path}")
+        if record_deltas:
+            print(f"  Per-image probability deltas present at {delta_path}")
         return concept_pool, per_image_pool
+
+    if record_deltas and pool_path and os.path.isfile(pool_path):
+        print("  Concept pool is cached but its probability deltas are not -- "
+              "recomputing the causal search to record them.")
 
     # ── Encode class text prompts ─────────────────────────────────────────────
     CLASS_PROMPTS = {0: "a photo of a landbird", 1: "a photo of a waterbird"}
@@ -2722,21 +3412,80 @@ def Generate_Concept_Pool(
     def _load(path):
         return clip_ft.preprocess(_PIL.open(path).convert("RGB"))
 
-    # ── Original predictions (batched + parallel image loading) ──────────────
-    orig_preds = []
+    # ── Which images this run touches at all ─────────────────────────────────
+    work_indices = (sorted(int(i) for i in image_subset)
+                    if image_subset is not None else list(range(len(te_paths))))
+    if image_subset is not None:
+        print(f"  Restricted to {len(work_indices)}/{len(te_paths)} images "
+              f"({100 * len(work_indices) / max(len(te_paths), 1):.1f}%)")
+
+    # ── Preprocess every needed image ONCE, then reuse ───────────────────────
+    img_cache = None
+    if cache_images:
+        with ThreadPoolExecutor(max_workers=n_workers) as io_pool:
+            tensors = list(tqdm(
+                io_pool.map(_load, [te_paths[i] for i in work_indices]),
+                total=len(work_indices), desc="  Caching preprocessed images",
+            ))
+        img_cache = dict(zip(work_indices, tensors))
+        cached_gb = sum(t.numel() * t.element_size() for t in tensors) / 1e9
+        print(f"  Cached {len(img_cache)} preprocessed images ({cached_gb:.2f} GB) "
+              f"-- each is reused across every pair it appears in instead of "
+              f"being decoded again")
+        del tensors
+
+    def _stack(idxs, io_pool):
+        """Pixel batch for these image indices, from RAM when cached."""
+        if img_cache is not None:
+            return torch.stack([img_cache[i] for i in idxs]).to(device)
+        return torch.stack(
+            list(io_pool.map(_load, [te_paths[i] for i in idxs]))
+        ).to(device)
+
+    # logit_scale (~100) makes a softmax over cosine sims meaningful -- raw
+    # sims sit in [-1, 1] and would come out nearly uniform. Same treatment
+    # the ablation reports in this file use.
+    logit_scale = clip_ft.model.logit_scale.exp().item()
+
+    # ── Original predictions (batched) ───────────────────────────────────────
+    # Full-length arrays indexed by global image index, but only the images
+    # this run touches get filled -- the pair loops below only ever read back
+    # rows they also wrote, and keeping global indexing avoids remapping ids
+    # everywhere else (the saved pools stay in test-set index space).
+    orig_preds = np.full(len(te_paths), -1, dtype=np.int64)
+    orig_probs = np.zeros((len(te_paths), txt.shape[0]), dtype=np.float32) if record_deltas else None
     with ThreadPoolExecutor(max_workers=n_workers) as io_pool:
-        for b in tqdm(range(0, len(te_paths), batch_size), desc="  Original predictions"):
-            batch_paths = te_paths[b:b + batch_size]
-            imgs  = torch.stack(list(io_pool.map(_load, batch_paths))).to(device)
+        for b in tqdm(range(0, len(work_indices), batch_size), desc="  Original predictions"):
+            batch_idx = work_indices[b:b + batch_size]
+            imgs  = _stack(batch_idx, io_pool)
             feats = clip_ft.model.encode_image(imgs).float()
             feats = feats / feats.norm(dim=-1, keepdim=True)
-            orig_preds.extend((feats @ txt.T).argmax(dim=-1).cpu().tolist())
-    orig_preds = np.array(orig_preds)
+            logits = feats @ txt.T
+            orig_preds[batch_idx] = logits.argmax(dim=-1).cpu().numpy()
+            if record_deltas:
+                orig_probs[batch_idx] = torch.softmax(
+                    logit_scale * logits, dim=-1).cpu().numpy()
+            if is_mps and (b // batch_size) % 10 == 0:
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+
+    # (img_idx, cid) → how much probability mass the flip pulled off the
+    # originally-predicted class. Populated only when record_deltas is set.
+    per_image_delta = {}
 
     # ── Find all unique concepts active in at least one image ─────────────────
-    active_mask    = te_reps > 0                                     # (N, L) bool
+    # Zeroing the rows outside the subset here is what restricts everything
+    # downstream: candidate_cids, all_pairs and the per-concept active-image
+    # lists all derive from this mask, so a concept never active in a subset
+    # image drops out on its own.
+    active_mask = te_reps > 0                                        # (N, L) bool
+    if image_subset is not None:
+        keep = torch.zeros(active_mask.shape[0], dtype=torch.bool)
+        keep[torch.tensor(work_indices, dtype=torch.long)] = True
+        active_mask = active_mask & keep.unsqueeze(1)
     candidate_cids = active_mask.any(dim=0).nonzero(as_tuple=True)[0].tolist()
-    print(f"  {len(candidate_cids)} active concepts to test across {len(te_paths)} images")
+    print(f"  {len(candidate_cids)} active concepts to test across "
+          f"{len(work_indices)} images")
 
     # ── Test each concept across ALL its active images (batched) ─────────────
     concept_pool_set = set()
@@ -2765,18 +3514,27 @@ def Generate_Concept_Pool(
                 chunk = all_pairs[b:b + batch_size]
                 cids     = [c for c, _ in chunk]
                 img_idxs = [i for _, i in chunk]
-                imgs = torch.stack(
-                    list(io_pool.map(_load, [te_paths[i] for i in img_idxs]))
-                ).to(device)
+                imgs = _stack(img_idxs, io_pool)
                 sample_concept_idx = torch.tensor(cids, dtype=torch.long, device=device)
                 feats = routesae_embeds_batched(
                     sae_model, clip_ft.model, imgs, sample_concept_idx,
                 ).float()
-                abl_preds = (feats @ txt.T).argmax(dim=-1).cpu().tolist()
+                abl_logits = feats @ txt.T
+                abl_preds  = abl_logits.argmax(dim=-1).cpu().tolist()
+                abl_probs  = (torch.softmax(logit_scale * abl_logits, dim=-1).cpu().numpy()
+                              if record_deltas else None)
                 for j, (cid, img_idx) in enumerate(chunk):
                     if abl_preds[j] != orig_preds[img_idx]:
                         concept_pool_set.add(cid)
                         per_image_pool.setdefault(img_idx, []).append(cid)
+                        if record_deltas:
+                            oc = int(orig_preds[img_idx])
+                            per_image_delta.setdefault(img_idx, {})[cid] = float(
+                                orig_probs[img_idx][oc] - abl_probs[j][oc]
+                            )
+                if is_mps and (b // batch_size) % 10 == 0:
+                    torch.mps.synchronize()
+                    torch.mps.empty_cache()
 
     else:
         with ThreadPoolExecutor(max_workers=n_workers) as io_pool:
@@ -2790,16 +3548,25 @@ def Generate_Concept_Pool(
                 try:
                     for b in range(0, len(active_img_indices), batch_size):
                         batch_idx = active_img_indices[b:b + batch_size]
-                        imgs  = torch.stack(
-                            list(io_pool.map(_load, [te_paths[i] for i in batch_idx]))
-                        ).to(device)
+                        imgs  = _stack(batch_idx, io_pool)
                         feats = clip_ft.model.encode_image(imgs).float()
                         feats = feats / feats.norm(dim=-1, keepdim=True)
-                        abl_preds = (feats @ txt.T).argmax(dim=-1).cpu().tolist()
+                        abl_logits = feats @ txt.T
+                        abl_preds  = abl_logits.argmax(dim=-1).cpu().tolist()
+                        abl_probs  = (torch.softmax(logit_scale * abl_logits, dim=-1).cpu().numpy()
+                                      if record_deltas else None)
                         for j, img_idx in enumerate(batch_idx):
                             if abl_preds[j] != orig_preds[img_idx]:
                                 concept_pool_set.add(cid)
                                 per_image_pool.setdefault(img_idx, []).append(cid)
+                                if record_deltas:
+                                    oc = int(orig_preds[img_idx])
+                                    per_image_delta.setdefault(img_idx, {})[cid] = float(
+                                        orig_probs[img_idx][oc] - abl_probs[j][oc]
+                                    )
+                        if is_mps and (b // batch_size) % 10 == 0:
+                            torch.mps.synchronize()
+                            torch.mps.empty_cache()
                 finally:
                     handle.remove()
 
@@ -2817,6 +3584,15 @@ def Generate_Concept_Pool(
         with open(per_img_path, "w") as f:
             json.dump({str(k): v for k, v in per_image_pool.items()}, f)
         print(f"  Per-image pool saved to {per_img_path}")
+
+        if record_deltas:
+            with open(delta_path, "w") as f:
+                json.dump(
+                    {str(i): {str(c): d for c, d in cd.items()}
+                     for i, cd in per_image_delta.items()},
+                    f,
+                )
+            print(f"  Per-image probability deltas saved to {delta_path}")
 
         lines = [f"Concept pool — {len(concept_pool)} causal concepts",
                  f"clip_model={clip_tag}  latent_dim={latent_dim}\n"]
@@ -3226,13 +4002,105 @@ def _write_ablation_report(
     return report_path
 
 
+# Short display labels for known ablation_results keys -- used only for the
+# combined report's column headers. An unrecognized key (a future method)
+# falls back to title-casing its name, so this never has to be kept in sync
+# to avoid breaking, just to keep looking nice.
+_ABLATION_METHOD_LABELS = {
+    "deactivation": "Deactivation",
+    "projection": "Projection",
+    "deactivation_candidates_only": "Deact (cand)",
+    "projection_candidates_only": "Proj (cand)",
+}
+
+
 @torch.no_grad()
+def load_orig_logits_cache(path, n_images, txt):
+    """Original (unablated) CLIP logits for a test split, if already computed.
+
+    Every ablation run re-derives the same unablated predictions before it can
+    report a delta against them, and that is a full CLIP pass over the test
+    set -- roughly half the work of a stage-3 run, repeated identically for
+    every threshold/percentage/method combination tried in the same sae_dir.
+    Caching them makes the second and later runs pay only for the ablated pass.
+
+    Returns a (N, n_classes) float tensor, or None when there is no usable
+    cache -- missing file, a different number of images (the test manifest
+    changed), or different text embeddings (different prompts or a different
+    CLIP), any of which would make the cached logits the wrong baseline. The
+    caller recomputes and overwrites in that case, so a stale cache costs one
+    run, not a wrong answer.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        z = np.load(path)
+        cached_logits, cached_txt = z["logits"], z["txt"]
+    except Exception as e:                       # unreadable/corrupt/old format
+        print(f"  Ignoring unreadable original-logits cache {path}: {e}")
+        return None
+
+    txt_np = txt.detach().cpu().numpy()
+    if cached_logits.shape[0] != n_images:
+        print(f"  Ignoring original-logits cache ({cached_logits.shape[0]} images "
+              f"cached, {n_images} in this test split) -- recomputing.")
+        return None
+    if cached_txt.shape != txt_np.shape or not np.allclose(cached_txt, txt_np, atol=1e-4):
+        print("  Ignoring original-logits cache (different text embeddings -- "
+              "prompts or CLIP weights changed) -- recomputing.")
+        return None
+
+    print(f"  Reusing cached original CLIP logits from {path} "
+          f"-- skipping the unablated pass.")
+    return torch.from_numpy(cached_logits)
+
+
+def save_orig_logits_cache(path, logits, txt):
+    """Store original logits + the text embeddings they were computed against,
+    so load_orig_logits_cache can tell a reusable cache from a stale one.
+
+    Written atomically -- to a process-unique temp file, then os.replace,
+    which is atomic within a filesystem. Under a SLURM array every task
+    misses the cache at startup and writes it at roughly the same moment;
+    writing straight to `path` would leave a half-written file that another
+    task could read as if it were complete. With the replace, the writes
+    simply race to be last and every reader sees one whole file or none.
+    """
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # np.savez appends '.npz' when the name lacks it, so the temp name has to
+    # carry the suffix itself or os.replace would move a path that np.savez
+    # never wrote.
+    tmp = f"{path}.{os.getpid()}.tmp.npz"
+    np.savez(tmp,
+             logits=logits.detach().cpu().numpy(),
+             txt=txt.detach().cpu().numpy())
+    os.replace(tmp, path)
+    print(f"  Original CLIP logits cached to {path}")
+
+
 def _write_combined_ablation_report(
     group_ids, true_labels, orig_preds, ablation_results,
     concept_idx, vocab_names, concept_match_scores,
     sae_dir, concept_extractor_name, report_suffix,
+    report_tag="both",
 ):
-    """Write one report comparing both independent ablation methods."""
+    """Write one report comparing every ablation method in `ablation_results`
+    (in insertion order) side by side against the original predictions.
+
+    Originally hardcoded to exactly {"deactivation", "projection"} (hence the
+    report filename's "__both") -- generalized to any number of methods so
+    variants like "*_candidates_only" (same technique, applied only to a
+    subset of images, the rest left at their original prediction) can be
+    added alongside without a second report.
+
+    report_tag : the filename segment between the extractor name and
+        report_suffix. Defaults to "both" for continuity with every report
+        already on disk using that name; pipeline_3_ablate.py passes the
+        single editing method it ran instead, since "both" would be a lie
+        for a one-variant report.
+    """
     if vocab_names is not None and concept_match_scores is not None:
         concept_names = [
             f"{cid}:{vocab_names[concept_match_scores[:, cid].argmax()]}"
@@ -3241,47 +4109,45 @@ def _write_combined_ablation_report(
     else:
         concept_names = [str(cid) for cid in concept_idx]
 
+    methods = list(ablation_results.keys())
+    labels  = [_ABLATION_METHOD_LABELS.get(m, m.replace("_", " ").title()) for m in methods]
+    delta_labels = ["Δ " + lbl for lbl in labels]
+    # Each column's width is driven by its own header text (e.g. "Δ Deactivation"
+    # is longer than "Deactivation") so the value/delta cells below -- which are
+    # always shorter, "82.4%"/"+17.6%" -- right-align under it with no overflow.
+    val_w   = [max(len(lbl), 6) for lbl in labels]
+    delta_w = [max(len(dl), 8) for dl in delta_labels]
+
+    header = f"{'Group':<42}  {'Original':>9}"
+    for lbl, dl, vw, dw in zip(labels, delta_labels, val_w, delta_w):
+        header += f"  {lbl:>{vw}}  {dl:>{dw}}"
+    rule = "-" * len(header)
+
     report_lines = [
         "Spurious concept ablation comparison",
-        "=" * 100,
+        "=" * len(header),
         f"Ablated concepts ({len(concept_idx)}): {', '.join(concept_names)}",
-        "-" * 100,
-        f"{'Group':<42}  {'Original':>9}  {'Deactivation':>13}  {'Δ Deact':>9}  "
-        f"{'Projection':>11}  {'Δ Proj':>8}",
-        "-" * 100,
+        rule,
+        header,
+        rule,
     ]
+
+    def _row(label, mask):
+        original_acc = (orig_preds[mask] == true_labels[mask]).mean()
+        line = f"{label:<42}  {original_acc * 100:>8.1f}%"
+        for m, vw, dw in zip(methods, val_w, delta_w):
+            acc = (ablation_results[m][mask] == true_labels[mask]).mean()
+            line += f"  {acc * 100:>{vw - 1}.1f}%  {(acc - original_acc) * 100:>+{dw - 1}.1f}%"
+        return line
+
     for gid in sorted(set(group_ids.tolist())):
         mask = group_ids == gid
-        original_acc = (orig_preds[mask] == true_labels[mask]).mean()
-        method_accs = {
-            name: (preds[mask] == true_labels[mask]).mean()
-            for name, preds in ablation_results.items()
-        }
-        report_lines.append(
-            f"Group {gid} ({GROUP_NAMES.get(gid, str(gid)):<35})  "
-            f"{original_acc * 100:>8.1f}%  "
-            f"{method_accs['deactivation'] * 100:>12.1f}%  "
-            f"{(method_accs['deactivation'] - original_acc) * 100:>+8.1f}%  "
-            f"{method_accs['projection'] * 100:>10.1f}%  "
-            f"{(method_accs['projection'] - original_acc) * 100:>+7.1f}%"
-        )
+        report_lines.append(_row(f"Group {gid} ({GROUP_NAMES.get(gid, str(gid))})", mask))
 
-    original_acc = (orig_preds == true_labels).mean()
-    overall_method_accs = {
-        name: (preds == true_labels).mean()
-        for name, preds in ablation_results.items()
-    }
-    report_lines += [
-        "-" * 100,
-        f"{'Overall':<42}  {original_acc * 100:>8.1f}%  "
-        f"{overall_method_accs['deactivation'] * 100:>12.1f}%  "
-        f"{(overall_method_accs['deactivation'] - original_acc) * 100:>+8.1f}%  "
-        f"{overall_method_accs['projection'] * 100:>10.1f}%  "
-        f"{(overall_method_accs['projection'] - original_acc) * 100:>+7.1f}%",
-    ]
+    report_lines += [rule, _row("Overall", np.ones_like(group_ids, dtype=bool))]
 
     report_text = "\n".join(report_lines) + "\n"
-    report_fname = f"ablation_report_{concept_extractor_name}__both{report_suffix}.txt"
+    report_fname = f"ablation_report_{concept_extractor_name}__{report_tag}{report_suffix}.txt"
     report_path = os.path.join(sae_dir, report_fname)
     with open(report_path, "w") as f:
         f.write(report_text)
@@ -3308,6 +4174,7 @@ def ablate_spurious_concepts(
     te_sae_reps=None,
     report_suffix="",
     write_report=True,
+    orig_logits_cache=None,
 ):
     """
     Zero out `spurious_concept_indices` SAE latents for every test image,
@@ -3374,22 +4241,29 @@ def ablate_spurious_concepts(
     # which is what actually correlated with the growth, not the data volume.
     BATCH_SIZE = 64
     all_paths = [s[0] for s in test_ds.samples]
-    orig_logits = []
-    for b in tqdm(range(0, len(all_paths), BATCH_SIZE), desc="  Original CLIP"):
-        if is_mps and (b // BATCH_SIZE) % 10 == 0:
-            print(f"  [{b}/{len(all_paths)}] MPS allocated: {torch.mps.current_allocated_memory() / 1e9:.3f} GB")
-            print(f"  [{b}/{len(all_paths)}] MPS driver allocated: {torch.mps.driver_allocated_memory() / 1e9:.3f} GB")
-        batch_paths = all_paths[b:b + BATCH_SIZE]
-        imgs = torch.stack([
-            clip_ft.preprocess(_PIL.open(p).convert("RGB")) for p in batch_paths
-        ]).to(device)
-        feats = clip_ft.model.encode_image(imgs).float()
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        orig_logits.append((feats @ txt.T).cpu())
-        if is_mps and (b // BATCH_SIZE) % 10 == 0:
-            torch.mps.synchronize()
-            torch.mps.empty_cache()
-    orig_logits = torch.cat(orig_logits, dim=0)     # (N, 2)
+
+    # Reused across runs when available -- these logits depend only on CLIP,
+    # the prompts and the test split, none of which the concept selection
+    # changes (see load_orig_logits_cache).
+    orig_logits = load_orig_logits_cache(orig_logits_cache, len(all_paths), txt)
+    if orig_logits is None:
+        orig_logits = []
+        for b in tqdm(range(0, len(all_paths), BATCH_SIZE), desc="  Original CLIP"):
+            if is_mps and (b // BATCH_SIZE) % 10 == 0:
+                print(f"  [{b}/{len(all_paths)}] MPS allocated: {torch.mps.current_allocated_memory() / 1e9:.3f} GB")
+                print(f"  [{b}/{len(all_paths)}] MPS driver allocated: {torch.mps.driver_allocated_memory() / 1e9:.3f} GB")
+            batch_paths = all_paths[b:b + BATCH_SIZE]
+            imgs = torch.stack([
+                clip_ft.preprocess(_PIL.open(p).convert("RGB")) for p in batch_paths
+            ]).to(device)
+            feats = clip_ft.model.encode_image(imgs).float()
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            orig_logits.append((feats @ txt.T).cpu())
+            if is_mps and (b // BATCH_SIZE) % 10 == 0:
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+        orig_logits = torch.cat(orig_logits, dim=0)     # (N, 2)
+        save_orig_logits_cache(orig_logits_cache, orig_logits, txt)
     orig_preds  = orig_logits.argmax(dim=1).numpy()
 
     # ── Ablated predictions ───────────────────────────────────────────────────
@@ -4018,6 +4892,7 @@ def ablate_spurious_concepts_routesae(
     editing_method="deactivation",
     P=None,
     write_report=True,
+    orig_logits_cache=None,
 ):
     """RouteSAE counterpart of ablate_spurious_concepts.
 
@@ -4069,16 +4944,25 @@ def ablate_spurious_concepts_routesae(
     is_mps = torch.device(device).type == "mps"
     all_paths = [s[0] for s in test_ds.samples]
 
+    # Reused across runs when available. Unlike the MSAE path this loop
+    # computes both passes together, so a hit skips only the unablated
+    # encode_image per batch -- the image loading and preprocessing are shared
+    # with the ablated pass and happen either way.
+    cached_orig = load_orig_logits_cache(orig_logits_cache, len(all_paths), txt)
+
     orig_logits, ablated_logits = [], []
-    for b in tqdm(range(0, len(all_paths), BATCH_SIZE), desc="  Original + ablated CLIP (RouteSAE)"):
+    desc = ("  Ablated CLIP (RouteSAE, original cached)" if cached_orig is not None
+            else "  Original + ablated CLIP (RouteSAE)")
+    for b in tqdm(range(0, len(all_paths), BATCH_SIZE), desc=desc):
         batch_paths = all_paths[b:b + BATCH_SIZE]
         imgs = torch.stack([
             clip_ft.preprocess(_PIL.open(p).convert("RGB")) for p in batch_paths
         ]).to(device)
 
-        feat = clip_ft.model.encode_image(imgs).float()
-        feat = feat / feat.norm(dim=-1, keepdim=True)
-        orig_logits.append((feat @ txt.T).cpu())
+        if cached_orig is None:
+            feat = clip_ft.model.encode_image(imgs).float()
+            feat = feat / feat.norm(dim=-1, keepdim=True)
+            orig_logits.append((feat @ txt.T).cpu())
 
         if editing_method == "projection":
             ablated_feat = routesae_embeds_projection(
@@ -4097,7 +4981,11 @@ def ablate_spurious_concepts_routesae(
             torch.mps.synchronize()
             torch.mps.empty_cache()
 
-    orig_logits    = torch.cat(orig_logits, dim=0)
+    if cached_orig is not None:
+        orig_logits = cached_orig
+    else:
+        orig_logits = torch.cat(orig_logits, dim=0)
+        save_orig_logits_cache(orig_logits_cache, orig_logits, txt)
     ablated_logits = torch.cat(ablated_logits, dim=0)
     orig_preds     = orig_logits.argmax(dim=1).numpy()
     ablated_preds  = ablated_logits.argmax(dim=1).numpy()
@@ -4590,6 +5478,133 @@ def select_prevalent_concepts(M, per_image_pool, concept_pool,
         )
     return candidate_concepts, concept_counts
 
+
+def score_labelfree_concepts(
+    M, per_image_pool, per_image_delta, concept_pool,
+    top_k_per_image=10, sae_dir=None,
+    vocab_names=None, concept_match_scores=None,
+):
+    """Score label-free concepts by causal influence. Alternative to
+    select_prevalent_concepts -- pick one or the other, not both.
+
+    select_prevalent_concepts ranks a concept purely by how many candidate
+    images it flips. This ranks it by how often it is among the STRONGEST
+    flippers of a candidate image, and by how hard it hits when it is:
+
+      For each candidate image, take the concepts that flip its prediction,
+      rank them by how much probability mass the flip pulled off the
+      originally-predicted class, and keep the top `top_k_per_image`.
+
+      prevalence(c) = #{candidate images where c made that top-k} / n_candidates
+          being in more candidate images' top-k scores higher.
+      strength(c)   = mean probability change over just those images
+          a bigger swing in the class probabilities scores higher.
+
+      score(c) = prevalence(c) × strength(c)
+
+    Same shape of score as find_spurious_concepts_highmag's, so the two
+    methods' outputs rank on comparable footing: "how often" × "how hard",
+    with strength averaged over the images that contributed to prevalence so
+    the two factors stay independent.
+
+    Parameters
+    ----------
+    M               : BoolTensor (N,) — candidate mask from candidate_selection
+    per_image_pool  : dict {img_idx: list[cid]} — from Generate_Concept_Pool
+    per_image_delta : dict {img_idx: {cid: float}} — probability change per
+                      flip, from Generate_Concept_Pool(record_deltas=True)
+    concept_pool    : list[int] — global concept pool; concepts outside it are
+                      ignored, matching select_prevalent_concepts
+    top_k_per_image : int — how many of each image's strongest flippers count
+    sae_dir         : optional str — writes labelfree_concepts_report.txt there
+
+    Returns
+    -------
+    candidate_concepts : list[int]           every concept scoring > 0, sorted
+                          by score descending
+    concept_scores     : dict {cid: float}   the score behind that order
+    """
+    candidate_indices = set(M.nonzero(as_tuple=True)[0].tolist())
+    concept_pool_set  = set(concept_pool)
+    n_cands           = len(candidate_indices)
+
+    counts      = {}   # cid → in how many candidate images' top-k it appears
+    delta_sums  = {}   # cid → summed probability change over those images
+    n_scored_images = 0
+
+    for img_idx, cids in per_image_pool.items():
+        if img_idx not in candidate_indices:
+            continue
+        deltas = per_image_delta.get(img_idx) or per_image_delta.get(str(img_idx)) or {}
+        # Rank this image's flippers by how much they moved the class
+        # probabilities, then keep its strongest `top_k_per_image`. A concept
+        # with no recorded delta (possible only if the pools and the delta
+        # file came from different runs) sorts last rather than crashing.
+        ranked = sorted(
+            (c for c in cids if c in concept_pool_set),
+            key=lambda c: deltas.get(c, deltas.get(str(c), 0.0)),
+            reverse=True,
+        )[:top_k_per_image]
+        if ranked:
+            n_scored_images += 1
+        for cid in ranked:
+            d = float(deltas.get(cid, deltas.get(str(cid), 0.0)))
+            counts[cid]     = counts.get(cid, 0) + 1
+            delta_sums[cid] = delta_sums.get(cid, 0.0) + d
+
+    concept_scores, prevalence, strength = {}, {}, {}
+    for cid, n in counts.items():
+        prevalence[cid] = n / n_cands if n_cands else 0.0
+        strength[cid]   = delta_sums[cid] / n
+        score           = prevalence[cid] * strength[cid]
+        if score > 0:
+            concept_scores[cid] = score
+
+    candidate_concepts = sorted(
+        concept_scores, key=lambda cid: concept_scores[cid], reverse=True
+    )
+
+    print(f"  Scored {len(counts)} concepts over {n_scored_images}/{n_cands} "
+          f"candidate images with ≥1 flipping concept "
+          f"(top {top_k_per_image} per image); {len(candidate_concepts)} score > 0")
+
+    if sae_dir is not None:
+        def _cname(cid):
+            return (
+                vocab_names[concept_match_scores[:, cid].argmax()]
+                if vocab_names is not None and concept_match_scores is not None
+                else str(cid)
+            )
+        shown = candidate_concepts[:50]
+        lines = [
+            "Label-free Concept Scoring (causal influence)",
+            f"score = prevalence x strength, over {n_cands} candidate images, "
+            f"top {top_k_per_image} flippers per image",
+            f"{len(candidate_concepts)} concepts score > 0; top {len(shown)} shown",
+            "=" * 80,
+            f"  {'Rank':>4}  {'Concept':<10}  {'Score':>10}  {'Images':>7}  "
+            f"{'Prevalence':>11}  {'MeanΔprob':>10}  {'Name'}",
+            "  " + "-" * 76,
+        ]
+        for rank, cid in enumerate(shown, start=1):
+            lines.append(
+                f"  {rank:>4}  {cid:<10}  {concept_scores[cid]:>10.5f}  "
+                f"{counts[cid]:>7}  {prevalence[cid]*100:>10.1f}%  "
+                f"{strength[cid]:>10.4f}  {_cname(cid)}"
+            )
+        if len(candidate_concepts) > len(shown):
+            lines.append(f"  ... and {len(candidate_concepts) - len(shown):,} more "
+                         f"(all returned to the caller)")
+        report_path = os.path.join(sae_dir, "labelfree_concepts_report.txt")
+        os.makedirs(sae_dir, exist_ok=True)
+        with open(report_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print("\n".join(lines))
+        print(f"\nLabel-free concept score report saved to {report_path}")
+
+    return candidate_concepts, concept_scores
+
+
 @torch.no_grad()
 def select_dialguided_concepts(
     te_results, ft_results, test_ds, ft_ds,
@@ -4635,11 +5650,46 @@ def select_dialguided_concepts(
     discover_from_vocab=False  (backup / hardcoded)
         SPURIOUS_ATTRS and GOOD_ATTRS are predefined lists (see below).
 
-    In both modes the final filtering is identical:
-        A SAE concept is kept if
-            max_sim(decoder_dir, spurious_attrs) >= spurious_sim_threshold
-          AND
-            max_sim(decoder_dir, good_attrs)     <  good_sim_threshold
+    Scoring (both modes)
+    --------------------
+    Per concept j and spurious attribute a, DIAL's quantity is
+
+        s(f_j,a) = (mean_{i∈P_a} z_ij − mean_{i∈N_a} z_ij) × cos(f_j, e_a)
+
+    where P_a / N_a partition the test images by whether zero-shot CLIP reads
+    attribute a as present. An attribute COUNTS for concept j only when BOTH
+    factors are positive -- it fires more where the attribute is, and points
+    the same way as the attribute -- rather than when the product is, which
+    would also admit a concept that is anti-aligned and fires less.
+
+        support(j)  = #{a : a counts for j} / n_attributes
+        strength(j) = mean s(f_j,a) over just those attributes
+        score(j)    = support(j) × strength(j)
+
+    Same "how often × how hard" decomposition as
+    find_spurious_concepts_highmag and score_labelfree_concepts, so the
+    methods' outputs rank on comparable footing. Breadth is the point of the
+    support factor: a concept tied to many background words is more likely a
+    background concept than one tied to a single word.
+
+    Selection is unchanged and independent of the score: a concept is
+    returned iff it is in K, the union over attributes of the smallest
+    prefix by |s| covering fraction `alpha` of that attribute's total |s|
+    mass. `alpha` still controls how many concepts come back. The score only
+    ORDERS that set, best first, so pipeline_3_ablate.py's
+    --ablation_top_percent takes its strongest end rather than an arbitrary
+    slice, and --concept_score_threshold can cut into it.
+
+    A concept can be in K and still score 0 -- selected on |s| mass through
+    attributes where the two factors were not both positive. Those are kept
+    (α decides membership) but sort last, behind everything with positive
+    evidence, and their count is reported.
+
+    NOTE: `good_sim_threshold` / GOOD_ATTRS are not part of the criterion.
+    The attribute sets are still discovered, printed and saved, but the
+    "AND dissimilar to bird-anatomy attributes" half this docstring used to
+    describe was never implemented in the scoring path (good_emb is
+    commented out below), and scoring did not add it.
 
     Hardcoded backup attribute dictionary
     --------------------------------------
@@ -4842,8 +5892,23 @@ def select_dialguided_concepts(
     neg_emb = _encode(neg_prompts).cpu()   # (A, D)
     spur_emb_cpu = spurious_emb.cpu()      # (A, D) — attribute text embeddings
 
-    # 4.4 — Score and select K_a for each attribute, accumulate K
+    # 4.4 — Score every concept over every attribute, then rank
+    #
+    # An attribute COUNTS for concept j only when both factors of s(f_j,a)
+    # are positive: the concept fires more on the images carrying the
+    # attribute (mu_P > mu_N) AND its decoder direction points the same way
+    # as the attribute's text embedding (cos > 0). Testing the product
+    # instead would also admit the doubly-negative case -- a concept that is
+    # anti-aligned with the attribute and fires LESS where it appears --
+    # which multiplies out positive while meaning the opposite of spurious.
+    # (The previous selection ranked by |s|, which admitted all four sign
+    # combinations.)
+    L_concepts = F_norm.shape[0]
+    counts = torch.zeros(L_concepts)          # attributes counted, per concept
+    sums   = torch.zeros(L_concepts)          # summed s over those attributes
+    n_attrs_scored = 0
     K: set[int] = set()
+
     for a_idx, a_name in enumerate(all_spurious):
         e_a   = spur_emb_cpu[a_idx]          # (D,)
         p_emb = pos_emb[a_idx]               # (D,)
@@ -4861,14 +5926,22 @@ def select_dialguided_concepts(
         # Mean activations over P_a and N_a → (L,)
         mu_P = Z[P_mask].mean(dim=0)
         mu_N = Z[N_mask].mean(dim=0)
+        diff = mu_P - mu_N                   # (L,)
 
         # CosSim(f_j, e_a) → (L,)
         cos_sim = F_norm @ e_a               # (L,)
 
         # s(f_j, a) → (L,)
-        s = (mu_P - mu_N) * cos_sim
+        s = diff * cos_sim
 
-        # Select K_a: smallest prefix covering fraction α of total |s| mass (not sure if it should be absolute value or count, and what does it mean if it should be count, but I don't think it should be absolute value)
+        counted = (diff > 0) & (cos_sim > 0)          # (L,) bool
+        counts += counted.float()
+        sums   += torch.where(counted, s, torch.zeros_like(s))
+        n_attrs_scored += 1
+
+        # Selection: smallest prefix covering fraction α of the total |s|
+        # mass, unioned over attributes into K. This is what decides WHICH
+        # concepts come back; the scores accumulated above decide their order.
         abs_s       = s.abs()
         total_mass  = abs_s.sum()
         if total_mass == 0:
@@ -4880,10 +5953,43 @@ def select_dialguided_concepts(
         K.update(K_a)
 
         print(f"[dialguided] attr '{a_name}': |P_a|={P_mask.sum()}, "
-              f"|N_a|={N_mask.sum()}, |K_a|={len(K_a)}")
+              f"|N_a|={N_mask.sum()}, counted={int(counted.sum())}, |K_a|={len(K_a)}")
 
+    # support = across how many of the scored attributes the concept counts;
+    # strength = how strongly it does so, averaged over just those attributes
+    # (divide by counts, not n_attrs_scored) so the two factors stay
+    # independent -- the same decomposition find_spurious_concepts_highmag
+    # and score_labelfree_concepts use.
+    support  = counts / max(n_attrs_scored, 1)                       # (L,) in [0,1]
+    strength = torch.where(counts > 0, sums / counts.clamp(min=1.0),
+                           torch.zeros_like(sums))                   # (L,)
+    scores   = support * strength                                    # (L,)
+
+    # Membership is the α-mass union K, unchanged. The scores do not decide
+    # WHICH concepts come back, only the order -- best first, so that
+    # pipeline_3_ablate.py's --ablation_top_percent takes the strongest end
+    # of this set rather than an arbitrary slice of it.
+    #
+    # A concept can be in K on |s| mass and still score 0 here: it earned its
+    # place through attributes where the two factors were not both positive
+    # (it fires LESS where the attribute is, or points the other way). Those
+    # stay in the list -- α decides membership -- but sort behind every
+    # concept with positive evidence, and their count is reported so the
+    # disagreement between the two criteria stays visible.
     candidate_concepts = sorted(K)
-    print(f"[dialguided] Total K = union of K_a: {len(candidate_concepts)} concepts")
+    # Stable sort: concepts tied on score (all the zeros, in particular) keep
+    # ascending concept-id order.
+    candidate_concepts.sort(key=lambda j: float(scores[j]), reverse=True)
+    candidate_concepts = [int(j) for j in candidate_concepts]
+    concept_scores = {int(j): float(scores[j]) for j in candidate_concepts}
+
+    n_zero_in_K = sum(1 for j in candidate_concepts if scores[j] <= 0)
+    n_positive  = int((scores > 0).sum().item())
+    print(f"[dialguided] α={alpha} |s|-mass union: {len(candidate_concepts):,} concepts "
+          f"selected, sorted by score over {n_attrs_scored}/{len(all_spurious)} attributes.")
+    print(f"[dialguided]   {n_zero_in_K:,} of them score 0 (selected on |s| mass through "
+          f"attributes where the two factors were not both positive); "
+          f"{n_positive:,} concepts score > 0 across the whole dictionary.")
 
     # ── 5. Log and save ───────────────────────────────────────────────────────
     attr_dict = {"mode": mode_tag, "spurious": SPURIOUS_ATTRS, "good": GOOD_ATTRS}
@@ -4895,11 +6001,56 @@ def select_dialguided_concepts(
     print(f"[dialguided/{mode_tag}] SAE concepts selected: {len(candidate_concepts)}")
 
     attr_path = os.path.join(sae_dir, f"dialguided_attribute_dict_{mode_tag}.json")
+    os.makedirs(sae_dir, exist_ok=True)
     with open(attr_path, "w") as f:
         json.dump(attr_dict, f, indent=2)
     print(f"[dialguided/{mode_tag}] Attribute dict saved → {attr_path}")
 
-    return candidate_concepts
+    # ── 6. Score report — same table the other scored methods write ──────────
+    def _cname(cid):
+        return (
+            vocab_names[concept_match_scores[:, cid].argmax()]
+            if vocab_names is not None and concept_match_scores is not None
+            else str(cid)
+        )
+
+    shown = candidate_concepts[:top_n_concepts]
+    lines = [
+        f"Dial-Guided Spurious Concept Selection  ({mode_tag})",
+        f"Selection: union over {n_attrs_scored} spurious attributes of the smallest "
+        f"prefix by |s| covering alpha={alpha} of that attribute's total |s| mass",
+        f"  -> {len(candidate_concepts):,} concepts of {L_concepts:,}",
+        f"Order: score = support x strength (does not affect membership)",
+        f"  support(j)  = fraction of attributes where concept j fires more on the",
+        f"                attribute's images AND aligns with its text direction",
+        f"  strength(j) = mean s(f_j,a) = (mu_P - mu_N) x cos(f_j, e_a) over just those",
+        f"  {n_zero_in_K:,} selected concepts score 0 (no attribute had both factors "
+        f"positive); they sort last",
+        f"  {n_positive:,} concepts score > 0 across the whole dictionary, in or out of "
+        f"the selection",
+        f"Top {len(shown)} shown",
+        "=" * 80,
+        f"  {'Rank':>4}  {'Concept':<10}  {'Score':>10}  {'Support':>9}  {'Attrs':>6}  "
+        f"{'Strength':>9}  {'Name'}",
+        "  " + "-" * 78,
+    ]
+    for rank, cid in enumerate(shown, start=1):
+        lines.append(
+            f"  {rank:>4}  {cid:<10}  {scores[cid]:>10.5f}  "
+            f"{support[cid] * 100:>8.1f}%  {int(counts[cid]):>6}  "
+            f"{strength[cid]:>9.4f}  {_cname(cid)}"
+        )
+    if len(candidate_concepts) > len(shown):
+        lines.append(f"  ... and {len(candidate_concepts) - len(shown):,} more "
+                     f"(all returned to the caller)")
+
+    report_path = os.path.join(sae_dir, "dialguided_concepts_report.txt")
+    with open(report_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"\n[dialguided/{mode_tag}] Concept score report saved → {report_path}")
+
+    return candidate_concepts, concept_scores
 
 
 ############## Deonie candidate conepts #########
@@ -6652,7 +7803,7 @@ def main():
 
     elif args.concept_finding_method == "dialguided":
         concept_extractor_name = concept_extractor_name + "_dialguided"
-        candidate_concepts = select_dialguided_concepts(
+        candidate_concepts, _concept_scores = select_dialguided_concepts(
             te_results=te_results,
             ft_results=ft_results,
             test_ds=test_ds,
@@ -6669,7 +7820,7 @@ def main():
         
     elif args.concept_finding_method == "highmag":
         concept_extractor_name = concept_extractor_name + "_highmag"
-        candidate_concepts, concept_source_group, concept_mis_prevalence = find_spurious_concepts_highmag(
+        candidate_concepts, concept_source_group, concept_mis_prevalence, _concept_scores = find_spurious_concepts_highmag(
             te_results=te_results,
             ft_results=ft_results,
             test_ds=test_ds,
@@ -6683,7 +7834,7 @@ def main():
 
     elif args.concept_finding_method == "labelguided":
         concept_extractor_name = concept_extractor_name + "_labelguided"
-        candidate_concepts, concept_source_group, concept_mis_prevalence = find_and_show_spurious_concepts_binary(
+        candidate_concepts, concept_source_group, concept_mis_prevalence, _concept_scores = find_and_show_spurious_concepts_binary(
             te_results=te_results,
             ft_results=ft_results,
             test_ds=test_ds,
@@ -6693,6 +7844,7 @@ def main():
             sae_dir=sae_dir,
             clip_ft=clip_ft,
             sae_model=sae_model, device=device,
+            top_n_concepts=args.top_k_concepts,
         )
     elif args.concept_finding_method == "none":
         # No concept-finding at all -- ablation runs with an empty concept
@@ -7084,6 +8236,7 @@ def main():
         )
 
         print(f"  Saving top-5 ft-train images for {len(save_concepts)} candidate concepts ...")
+        
         save_top_ft_images_per_concept(
             candidate_concepts=save_concepts,
             ft_results=ft_results,
