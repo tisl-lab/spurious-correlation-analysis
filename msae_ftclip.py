@@ -525,6 +525,32 @@ def find_top_concept_images(results, top_k=5, concept_index=None,
     return hits
 
 
+# ── Dataset settings ─────────────────────────────────────────────────────────
+# Everything dataset-specific -- class prompts, group names and structure,
+# which groups are misaligned and what each contrasts against, the image-dump
+# folder names, dialguided's attribute files -- comes from
+# dataset_settings.DatasetSpec. set_dataset() selects one and refreshes the
+# module globals below, so call it once (main() and every pipeline stage do)
+# before anything else in this module runs. Defaults to waterbirds, which
+# reproduces the values these globals held when they were literals.
+_SPEC = None
+
+
+def set_dataset(name):
+    """Select the dataset whose spec this module uses; returns the spec."""
+    global _SPEC, GROUP_NAMES
+    import dataset_settings
+    _SPEC = dataset_settings.get(name) if isinstance(name, str) else name
+    _SPEC.register_prompts()
+    GROUP_NAMES = _SPEC.group_names_dict()
+    return _SPEC
+
+
+def spec():
+    """The active DatasetSpec (waterbirds until set_dataset says otherwise)."""
+    return _SPEC if _SPEC is not None else set_dataset("waterbirds")
+
+
 GROUP_NAMES = {
     0: "landbird / land bg",
     1: "landbird / water bg",
@@ -542,9 +568,9 @@ def _clip_predict(clip_ft, path, device):
     
     
     
-    CLASS_PROMPTS = ["a photo of a Landbird", "a photo of a Waterbird"] ### should update to follow prism paper and use the same prompts as in prism zero-shot evaluation
-    CLASS_LABELS  = ["Landbird", "Waterbird"] ### should update to Landbird and Waterbird to follow prism paper and use the same prompts as in prism zero-shot evaluation
-        #### need to check if fine-tunning process and sae training process needs to update
+    _spec = spec()
+    CLASS_PROMPTS = _spec.class_prompt_list()
+    CLASS_LABELS  = list(_spec.class_names)
     tokens = openai_clip.tokenize(CLASS_PROMPTS).to(device)
     with torch.no_grad():
         txt  = clip_ft.model.encode_text(tokens).float()
@@ -1013,7 +1039,7 @@ def analyze_misclassified_concepts(
         # ── Classify all images in the group via clip_ft.run() ──────────────
         print(f"\nClassifying Group {gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — {len(g_indices)} images …")
         zs_stats      = clip_ft.run(dataset=group_ds, prompt_mode="shape",
-                                    dataset_name="waterbirds")
+                                    dataset_name=spec().name)
         mis_local     = np.where(
             np.array(zs_stats["predictions_shape"]) != np.array(zs_stats["true_labels"])
         )[0]
@@ -1509,6 +1535,7 @@ def find_spurious_concepts(
     Images  : sae_dir/test_images/{group_folder}/{cid}-{cname}/   ← misclassified test images
               sae_dir/ft_images/{class_folder}/{cid}-{cname}/     ← ft-set images activating concept
     """
+    _spec = spec()
     import shutil
 
     te_reps    = te_results["sae_representations"]   # (N_te, L)
@@ -1526,12 +1553,9 @@ def find_spurious_concepts(
 
     # Test-set misaligned groups: 2 = landbird/water bg, 3 = waterbird/land bg
     # FT set contains only aligned groups (landbird/land and waterbird/water)
-    MISALIGNED_GROUP_NAMES = {
-        1: "landbird / water bg",
-        2: "waterbird / land bg",
-    }
-    GROUP_FOLDER     = {1: "land_bird_on_water", 2: "water_bird_on_land"}
-    FT_CLASS_FOLDER  = {1: "water_birds",         2: "land_birds"}
+    MISALIGNED_GROUP_NAMES = _spec.misaligned_group_names()
+    GROUP_FOLDER     = _spec.group_folders_all()
+    FT_CLASS_FOLDER  = {g: _spec.ft_class_folder(g) for g in _spec.misaligned_groups()}
 
     report_lines = [
         "Misclassified Image Concept Analysis",
@@ -1550,7 +1574,7 @@ def find_spurious_concepts(
     concept_mis_prevalence  = {}   # cid → prevalence in that misaligned group
     group_top_sets   = {}
     group_prevalence = {}
-    for gid_mis in [1, 2]:
+    for gid_mis in _spec.misaligned_groups():
         # ensure keys always exist so plot functions don't KeyError on skipped groups
         group_top_sets[gid_mis]   = set()
         group_prevalence[gid_mis] = {}
@@ -1566,7 +1590,7 @@ def find_spurious_concepts(
         # ── Classify all images in the group via clip_ft.run() ──────────────
         print(f"\nClassifying Group {gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — {len(g_indices)} images …")
         zs_stats      = clip_ft.run(dataset=group_ds, prompt_mode="shape",
-                                    dataset_name="waterbirds")
+                                    dataset_name=_spec.name)
         mis_local     = np.where(
             np.array(zs_stats["predictions_shape"]) != np.array(zs_stats["true_labels"])
         )[0]
@@ -1617,8 +1641,8 @@ def find_spurious_concepts(
         #                                LOW  in group 0 (landbird/land)
         # gid_mis=2 (waterbird/land bg): HIGH in group 0 (landbird/land, same bg)
         #                                LOW  in group 3 (waterbird/water)
-        _aligned_high = {1: 3, 2: 0}
-        _aligned_low  = {1: 0, 2: 3}
+        _aligned_high = _spec.aligned_high()
+        _aligned_low  = _spec.aligned_low()
         high_reps = te_reps_np[group_ids_arr == _aligned_high[gid_mis]]
         low_reps  = te_reps_np[group_ids_arr == _aligned_low[gid_mis]]
 
@@ -1723,11 +1747,8 @@ def find_spurious_concepts(
             print(f"  Concept {cid} [{cname}]: "
                   f"test→{test_out}  ft→{ft_out}  plot→{plot_path}")
 
-            _te_grp_folders = {
-                0: "landbird_land_bg", 1: "landbird_water_bg",
-                2: "waterbird_land_bg", 3: "waterbird_water_bg",
-            }
-            _ft_lbl_folders = {0: "land_birds", 1: "water_birds"}
+            _te_grp_folders = _spec.group_folders_all()
+            _ft_lbl_folders = _spec.class_folders_all()
 
             bottom_te = np.argsort(te_reps_np[:, cid])[:10]
             bottom_ft = np.argsort(ft_reps_np[:, cid])[:10]
@@ -1894,7 +1915,7 @@ def find_spurious_concepts_binary(
         group_ds.manifest_path   = test_ds.manifest_path
 
         print(f"\nClassifying Group {gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — {len(g_indices)} images …")
-        zs_stats = clip_ft.run(dataset=group_ds, prompt_mode="shape", dataset_name="waterbirds")
+        zs_stats = clip_ft.run(dataset=group_ds, prompt_mode="shape", dataset_name=spec().name)
         mis_local     = np.where(
             np.array(zs_stats["predictions_shape"]) != np.array(zs_stats["true_labels"])
         )[0]
@@ -2142,10 +2163,11 @@ def find_spurious_concepts_highmag(
     concept_scores          : dict[int, float]   cid → score(c), the values
                               all_candidate_concepts is sorted by
     """
+    _spec = spec()
     te_reps_np    = te_results["sae_representations"].cpu().numpy()   # (N, L)
     group_ids_arr = np.array([s[3] for s in test_ds.samples])
 
-    MISALIGNED_GROUP_NAMES = {1: "landbird / water bg", 2: "waterbird / land bg"}
+    MISALIGNED_GROUP_NAMES = _spec.misaligned_group_names()
 
     all_candidate_concepts = []
     concept_source_group   = {}
@@ -2167,7 +2189,7 @@ def find_spurious_concepts_highmag(
         "=" * 80,
     ]
 
-    for gid_mis in [1, 2]:
+    for gid_mis in _spec.misaligned_groups():
         g_indices = np.where(group_ids_arr == gid_mis)[0]
 
         # ── Classify the misaligned group with clip_ft ────────────────────────
@@ -2177,7 +2199,7 @@ def find_spurious_concepts_highmag(
         group_ds.manifest_path   = test_ds.manifest_path
 
         print(f"\nClassifying Group {gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — {len(g_indices)} images …")
-        stats     = clip_ft.run(dataset=group_ds, prompt_mode="shape", dataset_name="waterbirds")
+        stats     = clip_ft.run(dataset=group_ds, prompt_mode="shape", dataset_name=_spec.name)
         preds     = np.array(stats["predictions_shape"])
         labels    = np.array(stats["true_labels"])
         mis_local = np.where(preds != labels)[0]
@@ -2320,6 +2342,7 @@ def find_concept_scope_concepts(
     for one class are considered as spurious concepts. 
     This method is label-agnostic and does not require true labels. 
     """
+    _spec = spec()
 
     import numpy as np
     from routesae import RouteSAE
@@ -2341,7 +2364,7 @@ def find_concept_scope_concepts(
         src_results, src_ds = te_results, test_ds
     else:
         raise ValueError(f"split must be 'ft_train' or 'test', got {split!r}")
-    dataset_name = "waterbirds"
+    dataset_name = _spec.name
 
     # get original predictions (and true labels, for reporting only)
     zs_stats = clip_ft.run(dataset=src_ds, prompt_mode="shape", dataset_name=dataset_name)
@@ -2739,6 +2762,7 @@ def find_and_show_spurious_concepts_binary(
     concept_scores          : dict[int, float]   cid → score(c), the values
                               all_candidate_concepts is sorted by
     """
+    _spec = spec()
     import shutil
 
     te_reps_np = te_results["sae_representations"].cpu().numpy()
@@ -2751,14 +2775,14 @@ def find_and_show_spurious_concepts_binary(
 
     group_ids_arr = np.array([s[3] for s in test_ds.samples])
 
-    MISALIGNED_GROUP_NAMES = {1: "landbird / water bg", 2: "waterbird / land bg"}
-    GROUP_FOLDER            = {1: "land_bird_on_water",  2: "water_bird_on_land"}
-    FT_CLASS_FOLDER         = {1: "water_birds",          2: "land_birds"}
+    MISALIGNED_GROUP_NAMES = _spec.misaligned_group_names()
+    GROUP_FOLDER            = _spec.group_folders_all()
+    FT_CLASS_FOLDER         = {g: _spec.ft_class_folder(g) for g in _spec.misaligned_groups()}
     # _aligned_high (group 1 -> 3, group 2 -> 0: the other class on the SAME
     # background) is the contrast this method does NOT use -- the score below
     # contrasts against _aligned_low, the same class on its own background.
-    _aligned_high           = {1: 3, 2: 0}
-    _aligned_low            = {1: 0, 2: 3}
+    _aligned_high           = _spec.aligned_high()
+    _aligned_low            = _spec.aligned_low()
 
     all_candidate_concepts = []
     concept_source_group   = {}
@@ -2785,7 +2809,7 @@ def find_and_show_spurious_concepts_binary(
         "=" * 80,
     ]
 
-    for gid_mis in [1, 2]:
+    for gid_mis in _spec.misaligned_groups():
         group_top_sets[gid_mis]   = set()
         group_prevalence[gid_mis] = {}
 
@@ -2797,7 +2821,7 @@ def find_and_show_spurious_concepts_binary(
         group_ds.manifest_path   = test_ds.manifest_path
 
         print(f"\nClassifying Group {gid_mis} ({MISALIGNED_GROUP_NAMES[gid_mis]}) — {len(g_indices)} images …")
-        zs_stats = clip_ft.run(dataset=group_ds, prompt_mode="shape", dataset_name="waterbirds")
+        zs_stats = clip_ft.run(dataset=group_ds, prompt_mode="shape", dataset_name=_spec.name)
         mis_local     = np.where(
             np.array(zs_stats["predictions_shape"]) != np.array(zs_stats["true_labels"])
         )[0]
@@ -2965,11 +2989,8 @@ def find_and_show_spurious_concepts_binary(
                 save_dir=ft_out,
             )
             # ── Lowest-activation (zero) images ──────────────────────────────
-            _te_grp_folders = {
-                0: "landbird_land_bg", 1: "landbird_water_bg",
-                2: "waterbird_land_bg", 3: "waterbird_water_bg",
-            }
-            _ft_lbl_folders = {0: "land_birds", 1: "water_birds"}
+            _te_grp_folders = _spec.group_folders_all()
+            _ft_lbl_folders = _spec.class_folders_all()
 
             # bottom_te = np.argsort(te_reps_np[:, cid])[:10]
             # bottom_ft = np.argsort(ft_reps_np[:, cid])[:10]
@@ -3183,8 +3204,8 @@ def candidate_selection(
                     'clip_representations' (N, D) and 'image_paths'.
     clip_ft       : CLIPZeroShot fine-tuned model used for pseudo-labels and
                     text embeddings.
-    class_prompts : dict {class_id: text_prompt}.  Defaults to waterbirds
-                    landbird/waterbird prompts.
+    class_prompts : dict {class_id: text_prompt}.  Defaults to the active
+                    DatasetSpec's class prompts (see set_dataset).
     k             : number of nearest neighbors.
     w             : weight on text embedding in the hybrid centroid (0 = pure
                     visual mean, 1 = pure text embedding).
@@ -3205,7 +3226,7 @@ def candidate_selection(
 
     # ── T: L2-normalised text embeddings, one per class ───────────────────────
     if class_prompts is None:
-        class_prompts = {0: "a photo of a landbird", 1: "a photo of a waterbird"}
+        class_prompts = spec().class_prompt_dict()
     T = clip_ft.encode_text_prompts(class_prompts).float().to(device)  # (C, D)
     C = T.shape[0]
 
@@ -3406,7 +3427,7 @@ def Generate_Concept_Pool(
               "recomputing the causal search to record them.")
 
     # ── Encode class text prompts ─────────────────────────────────────────────
-    CLASS_PROMPTS = {0: "a photo of a landbird", 1: "a photo of a waterbird"}
+    CLASS_PROMPTS = spec().class_prompt_dict()
     txt = clip_ft.encode_text_prompts(CLASS_PROMPTS).float()
 
     def _load(path):
@@ -4204,8 +4225,9 @@ def ablate_spurious_concepts(
     if torch.device(device).type == "mps":
         torch.mps.empty_cache()
 
-    CLASS_PROMPTS = ["a photo of a landbird", "a photo of a waterbird"]
-    CLASS_NAMES   = ["landbird", "waterbird"]
+    _spec = spec()
+    CLASS_PROMPTS = _spec.class_prompt_list()
+    CLASS_NAMES   = list(_spec.class_names)
     tokens = openai_clip.tokenize(CLASS_PROMPTS).to(device)
     txt    = clip_ft.model.encode_text(tokens).float()
     txt    = txt / txt.norm(dim=-1, keepdim=True)
@@ -4925,7 +4947,7 @@ def ablate_spurious_concepts_routesae(
             f"'deactivation' or 'projection', got {editing_method!r}."
         )
 
-    CLASS_PROMPTS = ["a photo of a landbird", "a photo of a waterbird"]
+    CLASS_PROMPTS = spec().class_prompt_list()
     tokens = openai_clip.tokenize(CLASS_PROMPTS).to(device)
     txt    = clip_ft.model.encode_text(tokens).float()
     txt    = txt / txt.norm(dim=-1, keepdim=True)
@@ -5703,6 +5725,7 @@ def select_dialguided_concepts(
                          plumage, breast, neck, body, foot, talon, crown, bill,
                          bird tail, bird wing, bird body, perch, avian
     """
+    _spec = spec()
     import json
     
     import clip as openai_clip
@@ -5734,17 +5757,8 @@ def select_dialguided_concepts(
         vocab_emb  = _encode(vocab_list)                   # (V, D)
 
         # Seed anchors: one representative phrase per category
-        ANCHORS = {
-            "landbird":  ["land background scenery",
-                          "trees forest ground nature background",
-                          "terrestrial landscape environment"],
-            "waterbird": ["water background scenery",
-                          "ocean sea lake shore aquatic background",
-                          "marine coastal environment"],
-            "good":      ["bird anatomy and body parts",
-                          "avian features feathers wings beak",
-                          "bird physical characteristics"],
-        }
+        # Per-class anchors + a "good" (class-evidence) anchor, from the spec.
+        ANCHORS = dict(_spec.anchors)
 
         # ── Encode class-specific images if image grounding is requested ─────
         if use_image_grounding:
@@ -5796,15 +5810,17 @@ def select_dialguided_concepts(
             top_idx = score.topk(k).indices.tolist()
             return [vocab_list[i] for i in top_idx]
 
-        _img_land  = img_emb_by_class.get(0) if use_image_grounding else None
-        _img_water = img_emb_by_class.get(1) if use_image_grounding else None
-        _img_all   = img_emb_all              if use_image_grounding else None
+        # One attribute set per class, grounded on that class's own images,
+        # plus the shared "good" (class-evidence) set over all of them.
+        _img_all = img_emb_all if use_image_grounding else None
+        per_class_attrs = [
+            _top_vocab(ANCHORS[cls], n_attrs,
+                       img_embs=img_emb_by_class.get(i) if use_image_grounding else None)
+            for i, cls in enumerate(_spec.class_names)
+        ]
+        good_attrs = _top_vocab(ANCHORS["good"], n_attrs, img_embs=_img_all)
 
-        land_attrs  = _top_vocab(ANCHORS["landbird"],  n_attrs, img_embs=_img_land)
-        water_attrs = _top_vocab(ANCHORS["waterbird"], n_attrs, img_embs=_img_water)
-        good_attrs  = _top_vocab(ANCHORS["good"],      n_attrs, img_embs=_img_all)
-
-        SPURIOUS_ATTRS = {"landbird": land_attrs, "waterbird": water_attrs}
+        SPURIOUS_ATTRS = dict(zip(_spec.class_names, per_class_attrs))
         GOOD_ATTRS     = good_attrs
         mode_tag = "vocab-discovery-image-grounded" if use_image_grounding else "vocab-discovery"
 
@@ -5834,11 +5850,11 @@ def select_dialguided_concepts(
         #     "bill", "bird tail", "bird wing", "bird body", "perch", "avian",
         # ]
         mode_tag = "hardcoded"
-        SPURIOUS_ATTRS = _load_spurious_attrs_from_files(sp_arribute_dir,attr_type="spurious")
-        GOOD_ATTRS = _load_spurious_attrs_from_files(sp_arribute_dir,attr_type="good")
+        SPURIOUS_ATTRS = _load_spurious_attrs_from_files(sp_arribute_dir, "spurious", _spec)
+        GOOD_ATTRS = _load_spurious_attrs_from_files(sp_arribute_dir, "good", _spec)
 
     # ── 3. Encode chosen attribute sets ───────────────────────────────────────
-    all_spurious = SPURIOUS_ATTRS["landbird"] + SPURIOUS_ATTRS["waterbird"]
+    all_spurious = [w for cls in _spec.class_names for w in SPURIOUS_ATTRS[cls]]
     spurious_emb = _encode(all_spurious)   # (2*n_attrs, D)
     # good_emb     = _encode(GOOD_ATTRS)     # (n_attrs, D)
     
@@ -5995,8 +6011,8 @@ def select_dialguided_concepts(
     attr_dict = {"mode": mode_tag, "spurious": SPURIOUS_ATTRS, "good": GOOD_ATTRS}
     print(f"[dialguided/{mode_tag}] spurious attrs: {len(all_spurious)}  "
           f"good attrs: {len(GOOD_ATTRS)}")
-    print(f"[dialguided/{mode_tag}] SPURIOUS landbird : {SPURIOUS_ATTRS['landbird']}")
-    print(f"[dialguided/{mode_tag}] SPURIOUS waterbird: {SPURIOUS_ATTRS['waterbird']}")
+    for _cls in _spec.class_names:
+        print(f"[dialguided/{mode_tag}] SPURIOUS {_cls}: {SPURIOUS_ATTRS[_cls]}")
     print(f"[dialguided/{mode_tag}] GOOD              : {GOOD_ATTRS}")
     print(f"[dialguided/{mode_tag}] SAE concepts selected: {len(candidate_concepts)}")
 
@@ -7128,29 +7144,35 @@ def prism_accuracy_by_subgroup(
     return results
 
 
-def _load_spurious_attrs_from_files(path: str, attr_type: str) -> dict:
-    """Load spurious attribute word lists from text files inside sae_dir/attribute_words/."""
-    
+def _load_spurious_attrs_from_files(path: str, attr_type: str, dataset_spec=None) -> dict:
+    """Attribute word lists from results/<dataset>/attribute_words/, keyed by
+    class name. Which file belongs to which class is the spec's
+    spurious_attr_files / good_attr_files -- waterbirds' are
+    ground_backgrounds.txt / water_backgrounds.txt and land_birds.txt /
+    water_birds.txt, exactly as this function used to hardcode."""
+    sp = dataset_spec or spec()
+    files = sp.spurious_attr_files if attr_type == "spurious" else sp.good_attr_files
+    if not files:
+        raise ValueError(f"{sp.name} has no {attr_type}_attr_files in its DatasetSpec; "
+                         f"dialguided needs word lists under {path}")
+
     def _read(fname):
-        with open(os.path.join(path, fname), "r") as f:
+        full = os.path.join(path, fname)
+        if not os.path.isfile(full):
+            raise FileNotFoundError(
+                f"dialguided attribute list not found: {full}\n"
+                f"Expected files for {sp.name}: {sorted(files.values())}")
+        with open(full, "r") as f:
             return [line.strip() for line in f if line.strip()]
-    
-    if attr_type == "spurious":
-        return {
-            "landbird":  _read("ground_backgrounds.txt"),
-            "waterbird": _read("water_backgrounds.txt"),
-        }
-    elif attr_type == "good":
-        return {
-            "landbird":  _read("land_birds.txt"),
-            "waterbird": _read("water_birds.txt"),
-        }
+
+    return {cls: _read(fn) for cls, fn in files.items()}
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     global _hf_model_dir
     args = parse_args()
+    set_dataset(args.dataset)   # class prompts, group structure, folders
     if args.hf_model_dir:
         _hf_model_dir = args.hf_model_dir
     if args.output_dir is None:
@@ -7211,7 +7233,9 @@ def main():
             def __len__(self): return len(self.ds)
             def __getitem__(self, idx):
                 img, label, bg_name, gid = self.ds[idx]
-                bg_int = 1 if bg_name == "water" else 0
+                # attribute name -> its index, from the spec (waterbirds:
+                # land=0, water=1; celeba: female=0, male=1)
+                bg_int = spec().attr_names.index(bg_name) if bg_name in spec().attr_names else 0
                 metadata = torch.tensor([bg_int, label], dtype=torch.long)
                 return img, label, metadata
 
@@ -7232,7 +7256,7 @@ def main():
         # ).mean(dim=1)
         # text_embeddings /= text_embeddings.norm(dim=-1, keepdim=True)
         # text_embeddings = text_embeddings.to(torch.float32)
-        _prism_cls  = ["Landbird", "Waterbird"]
+        _prism_cls  = [c.title() for c in spec().class_names]
         _prism_tmpl = ["a photo of a {}.", "a picture of a {}."]
         text_embeddings = prism_encode_text(
             clip_ft.model, _prism_cls, device, templates=tuple(_prism_tmpl)
@@ -7491,7 +7515,7 @@ def main():
         TRAIN_SIZES = {0: 3498, 1: 184, 2: 56, 3: 1057}
         _total_train = sum(TRAIN_SIZES.values())
 
-        _zs = clip_ft.run(dataset=test_ds, prompt_mode="shape", dataset_name="waterbirds")
+        _zs = clip_ft.run(dataset=test_ds, prompt_mode="shape", dataset_name=spec().name)
         _preds  = np.array(_zs["predictions_shape"])
         _labels = np.array(_zs["true_labels"])
         _gids   = np.array([s[3] for s in test_ds.samples])
@@ -7870,18 +7894,18 @@ def main():
 
         METHOD_TAG  = "prism_baseline"
         HOOK_TAG    = "orth_proj"
-        CLASS_NAMES = ["landbird", "waterbird"]
+        CLASS_NAMES = list(spec().class_names)
         sp_arribute_dir = "results/" + args.dataset + "/attribute_words"
         out_dir = os.path.join(sae_dir, METHOD_TAG, HOOK_TAG)
         os.makedirs(out_dir, exist_ok=True)
 
         _prism_args = argparse.Namespace(device=device, batch_size=args.batch_size)
-        _prism_cls  = ["Landbird", "Waterbird"]
+        _prism_cls  = [c.title() for c in spec().class_names]
         _prism_tmpl = ["a photo of a {}.", "a picture of a {}."]
         SPURIOUS_ATTRS = _load_spurious_attrs_from_files(sp_arribute_dir,attr_type="spurious")
         # _prism_spur = args.prism_spurious_words
 
-        _prism_spur = SPURIOUS_ATTRS["landbird"] + SPURIOUS_ATTRS["waterbird"]
+        _prism_spur = [w for cls in spec().class_names for w in SPURIOUS_ATTRS[cls]]
 
         class _PRISMCompatDataset(torch.utils.data.Dataset):
             def __init__(self, ds):
@@ -7889,7 +7913,9 @@ def main():
             def __len__(self): return len(self.ds)
             def __getitem__(self, idx):
                 img, label, bg_name, gid = self.ds[idx]
-                bg_int = 1 if bg_name == "water" else 0
+                # attribute name -> its index, from the spec (waterbirds:
+                # land=0, water=1; celeba: female=0, male=1)
+                bg_int = spec().attr_names.index(bg_name) if bg_name in spec().attr_names else 0
                 metadata = torch.tensor([bg_int, label], dtype=torch.long)
                 return img, label, metadata
 

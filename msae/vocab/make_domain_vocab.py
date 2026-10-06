@@ -1,32 +1,44 @@
 """Build a visually-grounded domain vocabulary for SAE concept naming.
 
-Produces a curated list of concrete terms relevant to Waterbirds-style photos:
-birds, animals, landscapes/nature, physical objects, colors/materials/textures,
-and the 200 CUB-200-2011 bird species that Waterbirds is built from.
+One curated term list per dataset, selected with --dataset:
+
+  waterbirds  birds, animals, landscapes/nature, objects, colours/materials/
+              textures and body parts, plus the 200 CUB-200-2011 species read
+              live from the Waterbirds metadata.csv.
+  celeba      faces and facial features, hair (colour, length, style), people
+              and gender words, accessories and makeup, expressions, portrait
+              photography, plus the 40 CelebA attribute names read live from
+              list_attr_celeba.
 
 The vocabulary is consumed by re-embedding it through CLIP's text encoder
-(msae/precompute_activations.py), NOT by reusing the fixed DISECT embeddings —
+(msae/precompute_activations.py), NOT by reusing the fixed DISECT embeddings --
 so words do NOT need to appear in clip_disect_20k.txt. We therefore keep every
-curated term, and only *report* DISECT coverage for information. The CUB species
-in particular are almost entirely absent from DISECT, which is exactly why they
-are worth adding.
+curated term, and only *report* DISECT coverage for information. The CUB
+species and the CelebA attribute names in particular are largely absent from
+DISECT, which is exactly why they are worth adding.
 
-CUB species are read live from the Waterbirds metadata.csv so the list is the
-exact 200 classes this dataset uses (no hand-transcription).
+The per-dataset "live" terms are read from the dataset itself rather than
+hand-transcribed, so they are exactly the classes/attributes in use.
+
+Output is named from the dataset's DatasetSpec.concept_vocab, so it matches
+what the pipeline asks for with --concept_match_vocab.
 
 Usage:
-    python msae/vocab/make_domain_vocab.py
+    python msae/vocab/make_domain_vocab.py                      # waterbirds
+    python msae/vocab/make_domain_vocab.py --dataset celeba
+    python msae/vocab/make_domain_vocab.py --dataset celeba --data_dir /path/to/data
 """
 
+import argparse
 import csv
 import os
 import re
+import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 SOURCE = os.path.join(SCRIPT_DIR, "clip_disect_20k.txt")
-OUTPUT = os.path.join(SCRIPT_DIR, "waterbirds_domain_vocab.txt")
-METADATA = os.path.join(REPO_ROOT, "data", "waterbirds", "metadata.csv")
+sys.path.insert(0, REPO_ROOT)
 
 # ── Candidate terms per category ────────────────────────────────────────────
 
@@ -140,7 +152,321 @@ ear ears finger fingers chin cheek forehead shoulder shoulders chest neck knee
 elbow skin teeth tongue thumb wrist ankle back hip hips waist beard eyebrow
 """.split()
 
-CATEGORIES = [
+# ── CelebA candidate terms ──────────────────────────────────────────────────
+# The target is hair colour and the spurious attribute is gender, so the list
+# leans on hair, faces and person words; accessories / expressions / portrait
+# terms cover what else a CelebA crop actually contains.
+#
+# One term PER LINE, not whitespace-split like the waterbirds lists above:
+# most of what matters here is multi-word ("blond hair", "receding hairline",
+# "wearing lipstick"), and splitting on spaces would shred exactly the phrases
+# the naming step needs.
+
+def _lines(block):
+    """One term per line, blank lines and '#' comments ignored."""
+    out = []
+    for line in block.strip().split("\n"):
+        term = line.split("#")[0].strip().lower()
+        if term:
+            out.append(term)
+    return out
+
+
+HAIR = _lines("""
+hair
+hairstyle
+haircut
+hairline
+receding hairline
+widow's peak
+scalp
+blond
+blonde
+blond hair
+blonde hair
+golden hair
+platinum blonde
+light hair
+dark hair
+black hair
+brown hair
+brunette
+chestnut hair
+auburn hair
+red hair
+ginger hair
+grey hair
+gray hair
+silver hair
+white hair
+bald
+balding
+bald head
+shaved head
+buzz cut
+crew cut
+bangs
+fringe
+curly hair
+wavy hair
+straight hair
+frizzy hair
+long hair
+short hair
+shoulder length hair
+ponytail
+pigtails
+hair bun
+braid
+braided hair
+cornrows
+dreadlocks
+afro
+updo
+bob cut
+pixie cut
+hair highlights
+dyed hair
+hair roots
+hair parting
+side part
+centre part
+slicked back hair
+messy hair
+tousled hair
+shiny hair
+thick hair
+thin hair
+hair colour
+blond eyebrows
+dark eyebrows
+""")
+
+FACES = _lines("""
+face
+facial features
+portrait
+head
+profile
+headshot
+eye
+eyes
+eyebrow
+eyebrows
+arched eyebrows
+bushy eyebrows
+eyelashes
+eyelid
+narrow eyes
+wide eyes
+nose
+pointy nose
+big nose
+nostrils
+mouth
+lips
+big lips
+thin lips
+teeth
+tongue
+mouth slightly open
+cheek
+cheeks
+high cheekbones
+rosy cheeks
+chin
+double chin
+jaw
+jawline
+forehead
+brow
+ear
+ears
+neck
+throat
+skin
+complexion
+pale skin
+fair skin
+tan skin
+olive skin
+dark skin
+wrinkles
+crease
+dimples
+freckles
+mole
+beauty mark
+blemish
+scar
+stubble
+5 o clock shadow
+beard
+no beard
+moustache
+goatee
+sideburns
+facial hair
+clean shaven
+oval face
+round face
+chubby face
+bags under eyes
+""")
+
+PEOPLE = _lines("""
+person
+people
+man
+men
+woman
+women
+male
+female
+boy
+girl
+gentleman
+lady
+adult
+child
+teenager
+young man
+young woman
+elderly person
+middle aged person
+masculine face
+feminine face
+celebrity
+actor
+actress
+model
+singer
+performer
+public figure
+crowd
+couple
+""")
+
+ACCESSORIES_MAKEUP = _lines("""
+glasses
+eyeglasses
+sunglasses
+reading glasses
+hat
+cap
+beanie
+beret
+headband
+bandana
+scarf
+veil
+hood
+earring
+wearing earrings
+necklace
+wearing necklace
+pendant
+choker
+jewelry
+piercing
+nose ring
+necktie
+wearing necktie
+bow tie
+collar
+shirt
+suit
+jacket
+dress
+makeup
+heavy makeup
+lipstick
+wearing lipstick
+lip gloss
+eyeliner
+eyeshadow
+mascara
+foundation makeup
+blush
+nail polish
+""")
+
+EXPRESSIONS = _lines("""
+smiling
+smile
+laughing
+grin
+frowning
+serious expression
+neutral expression
+mouth open
+mouth closed
+eyes open
+eyes closed
+squinting
+winking
+raised eyebrows
+furrowed brow
+surprised
+happy expression
+sad expression
+angry expression
+looking at camera
+looking away
+head tilt
+attractive
+""")
+
+PORTRAIT_PHOTO = _lines("""
+photograph
+photo
+snapshot
+selfie
+close up
+red carpet
+press event
+premiere
+camera flash
+studio lighting
+soft lighting
+harsh lighting
+backlight
+shadow
+highlight
+blurred background
+bokeh
+plain background
+dark background
+light background
+indoor
+outdoor
+microphone
+spotlight
+stage
+banner
+logo
+watermark
+grainy
+blurry
+sharp focus
+""")
+
+SKIN_COLOURS = _lines("""
+black
+white
+brown
+blond
+golden
+silver
+grey
+gray
+red
+auburn
+light
+dark
+""")
+
+WATERBIRDS_CATEGORIES = [
     ("animals",    ANIMALS),
     ("landscapes", LANDSCAPES),
     ("objects",    OBJECTS),
@@ -149,7 +475,25 @@ CATEGORIES = [
     ("animal_body_parts", ANIMAL_BODY_PARTS),
     ("human_body_parts",  HUMAN_BODY_PARTS),
 ]
+# NOTE: BIRDS is defined above but has never been part of this list, so none
+# of its exclusive terms (penguin, albatross, toucan, aviary, ...) are in the
+# published waterbirds vocabulary. Left as-is on purpose: the concept_match
+# .npy files were built from the current list, and adding terms would shift
+# every concept name. Add ("birds", BIRDS) here and regenerate the .npy if
+# you do want them.
 
+CELEBA_CATEGORIES = [
+    ("hair",                HAIR),
+    ("faces",               FACES),
+    ("people",              PEOPLE),
+    ("accessories_makeup",  ACCESSORIES_MAKEUP),
+    ("expressions",         EXPRESSIONS),
+    ("portrait_photo",      PORTRAIT_PHOTO),
+    ("skin_colours",        SKIN_COLOURS),
+    ("colors_materials_textures", COLORS_MATERIALS_TEXTURES),
+    ("objects",             OBJECTS),
+    ("human_body_parts",    HUMAN_BODY_PARTS),
+]
 
 def load_cub_species(metadata_path):
     """Return the 200 CUB-200-2011 class names (cleaned, class-index order).
@@ -170,30 +514,66 @@ def load_cub_species(metadata_path):
     return [by_index[i] for i in sorted(by_index)]
 
 
-def main():
-    with open(SOURCE) as f:
-        source_words = [w.strip() for w in f if w.strip()]
-    source_set = set(source_words)
+def load_celeba_attributes(data_dir):
+    """The 40 CelebA attribute names, read live from list_attr_celeba so the
+    list is exactly what this copy of the dataset annotates, e.g.
+    "5_o_Clock_Shadow" -> "5 o clock shadow", "Wearing_Lipstick" ->
+    "wearing lipstick". The CelebA analogue of the CUB species list.
+    """
+    root = os.path.join(data_dir, "celeba")
+    csv_p, txt_p = (os.path.join(root, "list_attr_celeba.csv"),
+                    os.path.join(root, "list_attr_celeba.txt"))
+    header = None
+    if os.path.isfile(csv_p):
+        with open(csv_p) as f:
+            header = f.readline().strip().split(",")[1:]
+    elif os.path.isfile(txt_p):
+        with open(txt_p) as f:
+            f.readline()                       # image count
+            header = f.readline().split()
+    if not header:
+        print(f"  [warn] list_attr_celeba not found under {root}; "
+              f"skipping CelebA attribute names.")
+        return []
+    return [re.sub(r"[_\s]+", " ", a).strip().lower() for a in header if a]
 
-    kept = []          # (term, category) in category order, deduped
-    seen = set()
+
+# name -> (category table, live-term loader, description of the live terms)
+DATASETS = {
+    "waterbirds": (WATERBIRDS_CATEGORIES,
+                   lambda d: load_cub_species(os.path.join(d, "waterbirds", "metadata.csv")),
+                   "cub_species"),
+    "celeba":     (CELEBA_CATEGORIES, load_celeba_attributes, "celeba_attributes"),
+}
+
+
+def build(dataset, data_dir, output=None):
+    """Write <dataset>'s vocabulary and return (path, kept terms)."""
+    import dataset_settings
+    if dataset not in DATASETS:
+        raise SystemExit(f"No term lists for {dataset!r}; known: {sorted(DATASETS)}. "
+                         f"Add a CATEGORIES table and a live-term loader above.")
+    categories, live_loader, live_name = DATASETS[dataset]
+    vocab_name = dataset_settings.get(dataset).concept_vocab or f"{dataset}_domain"
+    output = output or os.path.join(SCRIPT_DIR, f"{vocab_name}_vocab.txt")
+
+    with open(SOURCE) as f:
+        source_set = {w.strip() for w in f if w.strip()}
+
+    kept, seen = [], set()
 
     def add(term, category):
         if term and term not in seen:
             seen.add(term)
             kept.append((term, category))
 
-    for name, candidates in CATEGORIES:
+    for name, candidates in categories:
         for w in candidates:
             add(w, name)
+    for term in live_loader(data_dir):
+        add(term, live_name)
 
-    cub_species = load_cub_species(METADATA)
-    for sp in cub_species:
-        add(sp, "cub_species")
-
-    all_categories = [c for c, _ in CATEGORIES] + ["cub_species"]
-
-    with open(OUTPUT, "w") as f:
+    with open(output, "w") as f:
         for term, _ in kept:
             f.write(term + "\n")
 
@@ -201,14 +581,28 @@ def main():
     # DISECT coverage is informational only: the list is re-embedded via CLIP,
     # so terms absent from DISECT are still fully usable.
     in_disect = sum(1 for t, _ in kept if t in source_set)
-    print(f"Domain vocabulary : {len(kept)} terms  -> {OUTPUT}")
+    print(f"Dataset           : {dataset}  (vocab name: {vocab_name})")
+    print(f"Domain vocabulary : {len(kept)} terms  -> {output}")
     print(f"DISECT coverage   : {in_disect}/{len(kept)} terms also in clip_disect_20k "
           f"(rest are embedded fresh via CLIP text encoder)")
     print()
-    for name in all_categories:
+    for name in [c for c, _ in categories] + [live_name]:
         terms = [t for t, c in kept if c == name]
         cov = sum(1 for t in terms if t in source_set)
-        print(f"  {name:<26}: {len(terms):3d}  (in DISECT: {cov})")
+        print(f"  {name:<28}: {len(terms):3d}  (in DISECT: {cov})")
+    return output, kept
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dataset", default="waterbirds", choices=sorted(DATASETS))
+    ap.add_argument("--data_dir", default=os.path.join(REPO_ROOT, "data"),
+                    help="parent of the dataset folder, for the live-term lists")
+    ap.add_argument("--output", default=None,
+                    help="output path (default: msae/vocab/<concept_vocab>_vocab.txt)")
+    args = ap.parse_args()
+    build(args.dataset, args.data_dir, args.output)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ Usage:
         -m routesae_weights/routesae_K32_ViT-B~32_16384.pt \\
         -v results/waterbirds/embeddings/waterbirds_domain_ViT-B~32_zs_-1_text_954_512.npy \\
         -p results/waterbirds/embeddings/concept_match/RouteSAE \\
+    (CelebA: --dataset celeba, its own vocab .npy, and
+     -p results/celeba/embeddings/concept_match/RouteSAE)
         --clip ViT-B/32
 """
 
@@ -64,7 +66,12 @@ def parse_args() -> argparse.Namespace:
                    help='Companion vocab .txt (defaults to the sibling file, dim suffix dropped)')
     p.add_argument('--verify', type=int, default=0,
                    help='Causally verify the top N concepts by steering (needs --data)')
-    p.add_argument('--data', default=None, help='Waterbirds root, for --verify')
+    p.add_argument('--dataset', default='waterbirds',
+                   help='Dataset name in dataset_settings.REGISTRY, used with --verify '
+                        'to find that dataset\'s metadata.csv under --data.')
+    p.add_argument('--data', default=None,
+                   help='Dataset root for --verify (waterbirds: the metadata.csv folder; '
+                        'celeba: the parent of celeba/)')
     return p.parse_args()
 
 
@@ -185,10 +192,13 @@ def main() -> None:
                     f'score {best_val[cid]:.4f}')
 
     if args.verify and args.data:
+        import dataset_settings
         from routesae_train import make_loader
+        spec = dataset_settings.get(args.dataset)
         _, clip_model2 = load_clip(args.clip, device)
         preprocess, _ = load_clip(args.clip, device)
-        loader = make_loader(args.data, preprocess, 16, 'val', 16)
+        loader = make_loader(spec.metadata_path(args.data), preprocess, 16, 'val', 16,
+                             name=spec.name)
         pixel_values = next(iter(loader))[0].to(device)
 
         logger.info('Causal check (steering) on the top concepts:')

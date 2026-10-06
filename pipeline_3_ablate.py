@@ -449,6 +449,7 @@ def main():
     run_dir, _ = pc.resolve_run_dir_for_pipeline(args)
     manifest_path = pc.manifest_path_for(args, run_dir)
     manifest = pc.apply_analysis_params(pc.read_manifest(manifest_path), args)
+    pc.apply_dataset(manifest)   # spec from the run's dataset
 
     concepts_path = pc.concepts_path_for(manifest, args.concept_finding_method)
     concepts = pc.read_concepts(concepts_path)

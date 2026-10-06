@@ -23,3 +23,7 @@ env/
 .vscode/
 .env
 .envrc
+
+# RouteSAE outputs
+routesae_weights/
+routesae_results/

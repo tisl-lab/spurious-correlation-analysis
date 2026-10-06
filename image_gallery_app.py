@@ -1,18 +1,21 @@
 """
-Word-Filtered Image Gallery — Streamlit app
-=============================================
+Image Gallery — Streamlit app
+=============================
 
 What this does
 ---------------
-1. You give it a word list (a small file: one word per line, or a CSV/Excel
-   file with a column of words).
-2. You give it a base folder. Images for these words can live *anywhere*
-   under that folder, nested arbitrarily deep, spread across many
-   sub-folders — the app doesn't assume a fixed layout.
-3. You pick one word from a searchable dropdown.
-4. The app recursively scans the base folder once (and caches the scan),
-   then shows every image whose folder path or filename contains that
-   word as a substring, grouped by the folder it came from.
+1. You give it a base folder. Images can live *anywhere* under it, nested
+   arbitrarily deep, spread across many sub-folders — the app doesn't
+   assume a fixed layout.
+2. It recursively scans that folder once (and caches the scan), then shows
+   what it found, grouped by the sub-folder each image came from.
+3. Optionally you narrow things down: pick one sub-folder from the
+   dropdown, and/or type a filter string.
+
+Point it at a concepts/patches folder and it just shows everything — no
+word list, nothing to prepare. (An earlier version required uploading a
+word list and could only show images matching one word from it; the filter
+box below covers that case without the upload.)
 
 How to run
 ----------
@@ -23,66 +26,26 @@ Then open the URL it prints (usually http://localhost:8501).
 
 Notes
 -----
-- The word list file is uploaded through the browser each session (small
-  file, no path issues). The image base folder is given as a path on the
-  machine running the app, since it's expected to be large and stay put.
-- Matching is a plain substring check, case-insensitive by default —
-  "apple" matches "apple", "red_apple_v2", ".../apple/close_up.png", etc.
+- The base folder is given as a path on the machine running the app, since
+  it's expected to be large and stay put.
+- The filter is a plain substring check, case-insensitive by default —
+  "apple" matches "apple", "red_apple_v2", ".../apple/close_up.png".
   Turn on "Case sensitive" in the sidebar if you need exact-case matching.
-- The full recursive file scan is cached per base-folder path. If you add
-  or remove images while the app is running, use the "Rescan folder"
-  button in the sidebar rather than restarting the app.
+- The full recursive file scan is cached per base-folder path. If images
+  are added or removed while the app is running (a MACO run writing new
+  renders, say), use "Rescan folder" in the sidebar rather than restarting.
+- "Max images to display" is a safety cap: a big folder can hold thousands
+  of images and rendering them all will hang the browser, not the app.
 """
 
 import os
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 
-st.set_page_config(page_title="Image gallery by word", layout="wide")
-
-
-# ----------------------------------------------------------------------
-# Word list loading
-# ----------------------------------------------------------------------
-def load_words(uploaded_file) -> list[str]:
-    """Accepts a .txt (one word per line) or a .csv/.xlsx with a
-    'word'/'words' column (falls back to the first column)."""
-    name = uploaded_file.name.lower()
-
-    if name.endswith(".txt"):
-        text = uploaded_file.read().decode("utf-8", errors="ignore")
-        words = [line.strip() for line in text.splitlines() if line.strip()]
-    elif name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-        words = _column_of_words(df)
-    elif name.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(uploaded_file)
-        words = _column_of_words(df)
-    else:
-        st.error(f"Unsupported word-list file type: {uploaded_file.name}")
-        return []
-
-    # de-duplicate, keep first-seen order
-    seen = set()
-    deduped = []
-    for w in words:
-        if w not in seen:
-            seen.add(w)
-            deduped.append(w)
-    return deduped
-
-
-def _column_of_words(df: pd.DataFrame) -> list[str]:
-    for col in df.columns:
-        if str(col).strip().lower() in ("word", "words"):
-            return [str(v).strip() for v in df[col].dropna().tolist()]
-    # no obviously-named column — just use the first one
-    first_col = df.columns[0]
-    return [str(v).strip() for v in df[first_col].dropna().tolist()]
+st.set_page_config(page_title="Image gallery", layout="wide")
 
 
 # ----------------------------------------------------------------------
@@ -100,7 +63,8 @@ def scan_images(base_folder: str) -> list[str]:
     return found
 
 
-def matches_word(path: str, word: str, case_sensitive: bool, target: str) -> bool:
+def matches_filter(path: str, needle: str, case_sensitive: bool, target: str) -> bool:
+    """Substring test against the folder path, the file name, or both."""
     p = Path(path)
     haystacks = []
     if target in ("Folder names", "Both"):
@@ -108,7 +72,7 @@ def matches_word(path: str, word: str, case_sensitive: bool, target: str) -> boo
     if target in ("File names", "Both"):
         haystacks.append(p.name)
 
-    needle = word if case_sensitive else word.lower()
+    needle = needle if case_sensitive else needle.lower()
     for h in haystacks:
         h = h if case_sensitive else h.lower()
         if needle in h:
@@ -121,10 +85,6 @@ def matches_word(path: str, word: str, case_sensitive: bool, target: str) -> boo
 # ----------------------------------------------------------------------
 st.sidebar.header("Configuration")
 
-word_file = st.sidebar.file_uploader(
-    "Word list (.txt, .csv, or .xlsx)", type=["txt", "csv", "xlsx", "xls"]
-)
-
 base_folder = st.sidebar.text_input(
     "Base folder (searched recursively)",
     value="",
@@ -132,14 +92,20 @@ base_folder = st.sidebar.text_input(
     help="Every sub-folder under this path is searched, no matter how deep.",
 )
 
+text_filter = st.sidebar.text_input(
+    "Filter (optional)",
+    value="",
+    placeholder="e.g. squinting, patch, concept_1435",
+    help="Substring match against paths and/or file names. Leave empty to show everything.",
+)
 match_target = st.sidebar.radio(
-    "Match the word against", options=["Both", "Folder names", "File names"], index=0
+    "Match the filter against", options=["Both", "Folder names", "File names"], index=0
 )
 case_sensitive = st.sidebar.checkbox("Case sensitive match", value=False)
 n_cols = st.sidebar.slider("Gallery columns", min_value=2, max_value=8, value=4)
 max_images = st.sidebar.slider(
     "Max images to display", min_value=10, max_value=500, value=80, step=10,
-    help="Safety cap so a very common word doesn't try to render thousands of images.",
+    help="Safety cap so a large folder doesn't try to render thousands of images.",
 )
 
 if st.sidebar.button("🔄 Rescan folder"):
@@ -150,16 +116,7 @@ if st.sidebar.button("🔄 Rescan folder"):
 # ----------------------------------------------------------------------
 # Main area
 # ----------------------------------------------------------------------
-st.title("🖼️ Image gallery by word")
-
-if not word_file:
-    st.info("⬅️ Upload a word-list file in the sidebar to get started.")
-    st.stop()
-
-words = load_words(word_file)
-if not words:
-    st.error("Couldn't find any words in that file.")
-    st.stop()
+st.title("🖼️ Image gallery")
 
 if not base_folder:
     st.info("⬅️ Enter the base folder to search in the sidebar.")
@@ -170,19 +127,33 @@ if not Path(base_folder).is_dir():
     st.stop()
 
 all_images = scan_images(base_folder)
-st.caption(f"Indexed **{len(all_images):,}** image files under `{base_folder}`.")
-
-selected_word = st.selectbox(
-    f"Pick a word ({len(words)} available)", options=sorted(words)
-)
-
-matches = [p for p in all_images if matches_word(p, selected_word, case_sensitive, match_target)]
-
-if not matches:
-    st.warning(f"No images matched **'{selected_word}'**.")
+if not all_images:
+    st.warning(f"No image files found anywhere under `{base_folder}`.")
     st.stop()
 
-st.subheader(f"'{selected_word}' — {len(matches)} image(s) found")
+st.caption(f"Indexed **{len(all_images):,}** image files under `{base_folder}`.")
+
+# Sub-folder picker, built from what the scan actually found — this is what
+# replaces the old word list: the folders ARE the concepts.
+folders = sorted({str(Path(p).parent) for p in all_images})
+folder_labels = ["All folders"] + [os.path.relpath(f, base_folder) for f in folders]
+chosen = st.selectbox(f"Sub-folder ({len(folders)} with images)", options=folder_labels)
+
+matches = all_images
+if chosen != "All folders":
+    wanted = os.path.normpath(os.path.join(base_folder, chosen))
+    matches = [p for p in matches if os.path.normpath(str(Path(p).parent)) == wanted]
+if text_filter.strip():
+    matches = [p for p in matches
+               if matches_filter(p, text_filter.strip(), case_sensitive, match_target)]
+
+if not matches:
+    st.warning("Nothing matched that sub-folder / filter combination.")
+    st.stop()
+
+label = chosen if chosen != "All folders" else "all folders"
+suffix = f" matching '{text_filter.strip()}'" if text_filter.strip() else ""
+st.subheader(f"{label}{suffix} — {len(matches)} image(s)")
 
 if len(matches) > max_images:
     st.caption(

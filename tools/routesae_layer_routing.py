@@ -24,6 +24,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import dataset_settings  # noqa: E402
 from routesae_train import load_clip, clip_dims, make_loader  # noqa: E402
 from routesae import load_routesae, pre_process, clip_layer_stack  # noqa: E402
 
@@ -32,7 +33,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--clip", required=True, help="ViT-B/32, a fine-tuned .pt, or an HF id")
     ap.add_argument("--sae", required=True, help="Trained RouteSAE checkpoint (.pt)")
-    ap.add_argument("--data", required=True, help="Waterbirds root")
+    ap.add_argument("--dataset", default="waterbirds",
+                    help="Dataset name in dataset_settings.REGISTRY (waterbirds, celeba, ...)")
+    ap.add_argument("--data", required=True,
+                    help="Dataset root (waterbirds: the metadata.csv folder; "
+                         "celeba: the parent of celeba/)")
     ap.add_argument("--latent_size", type=int, default=16384)
     ap.add_argument("--k", type=int, default=32)
     ap.add_argument("--split", default="train", choices=["train", "val", "test"],
@@ -53,7 +58,8 @@ def main():
     sae = load_routesae(args.sae, hidden_size, n_layers, args.latent_size, args.k, device)
     sae.eval()
 
-    loader = make_loader(args.data, preprocess, args.batch_size, args.split, args.limit, shuffle=False)
+    spec = dataset_settings.get(args.dataset)
+    loader = make_loader(spec.metadata_path(args.data), preprocess, args.batch_size, args.split, args.limit, shuffle=False, name=spec.name)
     layer_hist = torch.zeros(sae.n_routed_layers)
 
     with torch.no_grad():

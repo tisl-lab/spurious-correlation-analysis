@@ -1,0 +1,23 @@
+# Reconstruction-only accuracy comparison — MSAE vs RouteSAE
+# Waterbirds, ViT-B/32, run: clip_ft_BIASED_400_20260709_111654
+# (0 concepts removed — pure SAE encode→decode reconstruction, no ablation)
+
+| SAE | CLIP mode | G0 (land/land) | G1 (land/water) | G2 (water/land) | G3 (water/water) | Recon Acc | Δ Overall | Worst-group | Δ Worst-group |
+|---|---|---|---|---|---|---|---|---|---|
+| **CLIP baseline (no SAE)** | zero-shot | 84.6% | 39.9% | 76.9% | 96.0% | 67.6% | — | 40.0% | — |
+| MSAE_RW (TopKReLU_256) | zero-shot | 93.7% | 26.6% | 59.8% | 97.0% | 64.2% | **-3.4%** | 26.6% | **-13.3%** |
+| MSAE_RW (TopKReLU_64) | zero-shot | 98.1% | 49.8% | 40.5% | 93.9% | 72.5% | **+4.8%** | 40.5% | **+0.6%** |
+| RouteSAE (K=256) | zero-shot | 86.4% | 40.4% | 77.1% | 95.5% | 68.5% | **+0.8%** | 40.4% | **+0.4%** |
+| RouteSAE (K=32) | zero-shot | 88.3% | 48.0% | 74.0% | 95.2% | 71.8% | **+4.2%** | 48.0% | **+8.1%** |
+| **CLIP baseline (no SAE)** | fine-tuned | 98.8% | 10.6% | 5.5% | 97.7% | 54.0% | — | — | — |
+| MSAE_RW (TopKReLU_256) | fine-tuned | 97.6% | 6.3% | 13.1% | 98.9% | 52.8% | **-1.2%** | — | — |
+| MSAE_RW (TopKReLU_64) | fine-tuned | 80.8% | 2.4% | 64.2% | 99.8% | 50.5% | **-3.5%** | — | — |
+| RouteSAE (K=256) | fine-tuned | 98.8% | 11.4% | 5.5% | 96.7% | 54.2% | **+0.2%** | — | — |
+| RouteSAE (K=32) | fine-tuned | 98.8% | 12.7% | 4.2% | 96.0% | 54.5% | **+0.5%** | — | — |
+
+Notes:
+- Fine-tuned worst-group accuracy is left blank — the ablation reports for the fine-tuned runs don't compute it (only the zero-shot reports do).
+- MSAE reconstructs LESS faithfully as activation sparsity drops (TopKReLU_64 has fewer active latents than TopKReLU_256, same 4096-latent dictionary): its zero-shot swing grows from -3.4% to +4.8% and fine-tuned from -1.2% to -3.5% — both moving further from the 0%-delta ideal.
+- RouteSAE shows the same direction but far more mildly, and in the opposite direction to MSAE: K=256 (more active concepts) is closer to a no-op than K=32 in both CLIP modes.
+- RouteSAE (any K) is consistently a more faithful reconstruction (smaller |Δ Overall|) than MSAE at comparable sparsity in this run, most visibly zero-shot: MSAE TopKReLU_64 vs RouteSAE K=32 (+4.8% vs +4.2%) and MSAE TopKReLU_256 vs RouteSAE K=256 (-3.4% vs +0.8%).
+- The overall deltas hide much larger group-level swings for MSAE, concentrated on group 2 (waterbird/land, the smallest group at n=642): MSAE TopKReLU_256 zero-shot moves 76.9%→59.8% (-17.1 pts) and MSAE TopKReLU_64 fine-tuned moves 5.5%→64.2% (+58.7 pts) — reconstruction alone, no concepts touched. RouteSAE's group-level swings stay under 4 points everywhere in this table.

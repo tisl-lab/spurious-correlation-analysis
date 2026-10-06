@@ -56,6 +56,7 @@ def main():
 
     print("MANIFEST_EXISTS=1")
     manifest = pc.apply_analysis_params(pc.read_manifest(manifest_path), args)
+    pc.apply_dataset(manifest)   # spec from the run's dataset
     concepts_path = pc.concepts_path_for(manifest, args.concept_finding_method)
 
     print(f"SAE_DIR={manifest['sae_dir']}")

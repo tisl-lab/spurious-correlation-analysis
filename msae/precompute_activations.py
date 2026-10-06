@@ -55,7 +55,35 @@ SUPPORTED_VOCABS = {
     "laion": ["laion_unigram", "laion_bigrams"],  # Combined vocabulary
     "disect": "msae/vocab/clip_disect_20k.txt",
     "waterbirds_domain": "msae/vocab/waterbirds_domain_vocab.txt",
+    "celeba_domain": "msae/vocab/celeba_domain_vocab.txt",
 }
+
+
+def _register_dataset_vocabs():
+    """Add every dataset_settings spec's concept_vocab whose file exists, so a
+    dataset registered there is usable here without editing this dict. The
+    literal entries above win on name collision -- they are the ones whose
+    paths do not follow the <concept_vocab>_vocab.txt convention, and the
+    existing embeddings were built from them.
+
+    Built by msae/vocab/make_domain_vocab.py --dataset <name>.
+    """
+    try:
+        import sys as _sys
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
+        import dataset_settings
+    except Exception as exc:                      # registry optional, never fatal
+        logger.debug(f"dataset_settings unavailable ({exc}); using the literal vocab list")
+        return
+    for spec in dataset_settings.REGISTRY.values():
+        name = getattr(spec, "concept_vocab", "")
+        if not name or name in SUPPORTED_VOCABS:
+            continue
+        path = os.path.join("msae", "vocab", f"{name}_vocab.txt")
+        if os.path.isfile(os.path.join(_root, path)):
+            SUPPORTED_VOCABS[name] = path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +93,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+_register_dataset_vocabs()
 
 
 def parse_args() -> argparse.Namespace:

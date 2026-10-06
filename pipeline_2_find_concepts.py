@@ -61,6 +61,7 @@ def main():
     run_dir, _ = pc.resolve_run_dir_for_pipeline(args)
     manifest_path = pc.manifest_path_for(args, run_dir)
     manifest = pc.apply_analysis_params(pc.read_manifest(manifest_path), args)
+    pc.apply_dataset(manifest)   # spec from the run's dataset
 
     concepts_path = pc.concepts_path_for(manifest, method)
     candidate_images_path = pc.candidate_images_path_for(manifest)
@@ -204,7 +205,13 @@ def main():
             candidate_concepts, concept_counts = core.select_prevalent_concepts(
                 M=M, per_image_pool=per_image_pool, concept_pool=concept_pool,
                 prevalence_threshold=args.prevalence_threshold,
-                top_k=args.top_k_concepts, n_cpu_workers=args.n_cpu_workers,
+                # select_prevalent_concepts gives top_k priority over the
+                # threshold, so a positive --top_k_concepts makes
+                # --prevalence_threshold a no-op. <=0 means "no cap, select by
+                # prevalence" -- the only way to reach threshold mode from the
+                # CLI. The default (20) is unchanged.
+                top_k=(None if args.top_k_concepts <= 0 else args.top_k_concepts),
+                n_cpu_workers=args.n_cpu_workers,
             )
             suffix = f"over {n_candidates} candidate images (label-free causal search)"
 

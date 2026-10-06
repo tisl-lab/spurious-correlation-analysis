@@ -38,6 +38,7 @@ def main():
     if args.hf_model_dir:
         core._hf_model_dir = args.hf_model_dir
 
+    pc.apply_dataset(args)        # class prompts / group structure for this dataset
     run_dir, metadata = pc.resolve_run_dir_for_pipeline(args)
     print(f"\nRun folder : {os.path.abspath(run_dir)}")
     print(f"Metadata   : {metadata}")

@@ -87,7 +87,9 @@ def add_core_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-a", "--activation", type=str, default="TopKReLU_256")
     p.add_argument("--knn_k", type=int, default=10)
     p.add_argument("--prevalence_threshold", type=float, default=0.15)
-    p.add_argument("--concept_match_vocab", type=str, default="waterbirds_domain")
+    # Default resolved per dataset by apply_dataset(): waterbirds keeps
+    # "waterbirds_domain", others take their spec's concept_vocab.
+    p.add_argument("--concept_match_vocab", type=str, default=None)
     p.add_argument("--stage1_manifest", type=str, default=None,
                    help="Explicit path to a stage1_manifest.json, overriding the "
                         "<base_sae_dir>/stage1_manifest.json this would otherwise "
@@ -490,6 +492,28 @@ def resolve_device() -> str:
 
 
 # ── Stage-1 context reload (used by stages 2, 3, 4) ─────────────────────────
+
+def apply_dataset(manifest_or_args):
+    """Select the DatasetSpec msae_ftclip uses, from a manifest or an args
+    namespace. Every stage calls this before touching core, so the class
+    prompts / group structure follow the run's dataset instead of the
+    waterbirds default. Manifests written before the field existed fall back
+    to waterbirds, which is what they were."""
+    is_args = not isinstance(manifest_or_args, dict)
+    name = (getattr(manifest_or_args, "dataset", "waterbirds") if is_args
+            else manifest_or_args.get("dataset", "waterbirds"))
+    spec = core.set_dataset(name)
+    # Fill in the per-dataset defaults that argparse cannot know before
+    # --dataset is parsed. Only when the flag was left unset, so an explicit
+    # value always wins.
+    if is_args:
+        if getattr(manifest_or_args, "concept_match_vocab", None) in (None, ""):
+            manifest_or_args.concept_match_vocab = spec.concept_vocab or "waterbirds_domain"
+        if (getattr(manifest_or_args, "run_dir", None) in (None, "")
+                and spec.default_run_dir):
+            manifest_or_args.run_dir = spec.default_run_dir
+    return spec
+
 
 def load_stage1_context(manifest: dict) -> dict:
     """Reload CLIP + SAE + datasets + cached representations + concept_match
